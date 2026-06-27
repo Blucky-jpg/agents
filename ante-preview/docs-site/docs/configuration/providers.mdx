@@ -1,0 +1,138 @@
+---
+title: Providers
+description: "Pick and configure your model provider"
+---
+
+Ante is provider-agnostic. Each provider implements a common interface for sending prompts and receiving streaming responses, and providers and models are resolved from a catalog at session start.
+
+This page covers the everyday tasks: picking a provider, authenticating, and customizing the catalog. For the complete list of built-in providers, every model they serve, and the full `catalog.json` schema, see the [Catalog Reference](/reference/catalog-reference).
+
+## Selecting a provider
+
+You can set your provider three ways, in order of precedence:
+
+1. **CLI flag** — `ante --provider anthropic --model claude-sonnet-4-6`
+2. **Settings file** — set `provider` and `model` in `~/.ante/settings.json`
+3. **Auto-detect** — if you specify neither, Ante uses the first provider you have credentials for (and `local` if none).
+
+Every provider id you can pass to `--provider` is listed in the [Catalog Reference](/reference/catalog-reference#built-in-providers).
+
+## Authentication
+
+Most providers read an API key from an environment variable; Anthropic, OpenAI, and Antix can also sign in interactively via OAuth in the TUI.
+
+```bash
+# API key
+export ANTHROPIC_API_KEY="sk-ant-..."
+ante --provider anthropic --model claude-sonnet-4-6
+```
+
+Each provider's exact auth method (env var name or OAuth) is in the [Catalog Reference](/reference/catalog-reference#built-in-providers).
+
+:::tip
+When using third-party providers, make sure the model supports tool use (function calling) — Ante relies on it for agent capabilities. If results are poor, try a larger or more capable model.
+:::
+
+## Custom catalog
+
+Create `~/.ante/catalog.json` to add a provider Ante doesn't ship, override a built-in one, or tweak a model's defaults. It is merged on top of the built-in presets at startup, so you only specify what you want to add or change. The examples below are the common cases; see the [Catalog Reference](/reference/catalog-reference#catalogjson-schema) for the full schema, authentication forms, and resolution rules.
+
+### Add a hosted provider
+
+Most hosted endpoints are OpenAI-compatible. Register one with `wire_style: "OpenAiCompatible"`, point `base_url` at it, and list the models you want to appear in the picker:
+
+```json
+{
+  "providers": {
+    "together": {
+      "id": "together",
+      "display_name": "Together AI",
+      "base_url": "https://api.together.xyz/v1",
+      "wire_style": "OpenAiCompatible",
+      "auth": { "bearer": { "env_key": "TOGETHER_API_KEY" } },
+      "preferred_models": [
+        {
+          "id": "moonshotai/Kimi-K2-Instruct",
+          "description": "Kimi K2 on Together",
+          "max_tokens": 16384,
+          "context_limit": 128000,
+          "thinking": "Enabled"
+        }
+      ]
+    }
+  }
+}
+```
+
+```bash
+export TOGETHER_API_KEY="..."
+ante --provider together --model moonshotai/Kimi-K2-Instruct
+```
+
+### Add a local provider with no auth
+
+Omit `auth` for a provider that needs no key, and leave `preferred_models` off when the provider has no stable picker/default model list — handy for a local server like Ollama where the available models change as you pull them. You can still pass any model id explicitly with `--provider` and `--model`:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "id": "ollama",
+      "display_name": "Ollama",
+      "base_url": "http://localhost:11434/v1",
+      "wire_style": "OpenAiCompatible"
+    }
+  }
+}
+```
+
+```bash
+ante --provider ollama --model qwen2.5-coder:7b
+```
+
+### Override model defaults
+
+The `models` section patches a model by id without redefining it. Each field you set replaces the built-in default; everything else is left alone:
+
+```json
+{
+  "models": {
+    "claude-opus-4-8": { "thinking": "Max" },
+    "claude-sonnet-4-6": { "thinking": "Deep", "max_tokens": 64000 },
+    "gpt-5.5": { "temperature": 0.2 }
+  }
+}
+```
+
+## Third-party providers
+
+### Using Open Router
+
+1. Sign up at [openrouter.ai](https://openrouter.ai/) and generate an API key.
+2. Set your API key:
+   ```bash
+   export OPENROUTER_API_KEY="sk-or-..."
+   ```
+3. Use any model from [Open Router's model list](https://openrouter.ai/models):
+   ```bash
+   ante --provider openrouter --model deepseek/deepseek-reasoner
+   ```
+
+### OpenAI-compatible providers
+
+Many LLM providers expose an OpenAI-compatible API (e.g., Together AI, Fireworks, Groq Cloud, Perplexity). For a one-off you can reuse the built-in `openai-compatible` provider via env vars (no catalog edit needed):
+
+1. Set the base URL — the per-provider variable takes precedence over `MODEL_BASE_URL`:
+   ```bash
+   export OPENAI_COMPATIBLE_BASE_URL="https://api.together.xyz/v1"
+   ```
+2. Set your API key:
+   ```bash
+   export OPENAI_COMPATIBLE_API_KEY="your-provider-api-key"
+   ```
+3. Run with the OpenAI Compatible provider:
+   ```bash
+   ante --provider openai-compatible --model meta-llama/Llama-3-70b-chat-hf
+   ```
+
+For something you'll use repeatedly, add a named provider to your [custom catalog](#custom-catalog) instead so it shows up in the picker.

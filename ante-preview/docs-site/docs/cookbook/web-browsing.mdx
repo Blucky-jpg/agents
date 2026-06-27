@@ -1,0 +1,26 @@
+---
+title: Web Browsing & Reading Docs
+description: "Let Ante search the web and fetch content from URLs"
+---
+
+# Web Browsing & Reading Docs
+
+Ante can search the web and fetch content from URLs, letting you pull in documentation, look up APIs, or research topics without leaving the terminal.
+
+## Searching the web
+
+Just ask naturally — Ante will use its web browsing tools to find what you need:
+
+<img src="/assets/cookbook/webbrowse.gif" alt="Ante performing a web search" style={{width: '100%', borderRadius: '8px', margin: '16px 0'}} />
+
+The agent can:
+
+- **Search the web** for documentation, examples, and answers
+- **Fetch a URL** to read its contents directly (e.g., API docs, release notes, blog posts)
+- **Summarize** the results and integrate them into the conversation
+
+This is particularly useful when you're working with an unfamiliar library or need to check the latest documentation for a tool or API.
+
+:::tip
+You can also pipe web content into Ante from the command line: `curl https://example.com/docs | ante -p "summarize this"`.
+:::

@@ -1,0 +1,83 @@
+---
+title: "MCP Servers"
+description: "Connect Ante to external tools through the Model Context Protocol"
+---
+
+Ante can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers to surface their tools to the agent. Each configured server is launched as a subprocess and its tools become callable like any built-in tool.
+
+<img src="/assets/mcp-demo.gif" alt="MCP server inspection and tool calls in the Ante TUI" style={{width: '100%', borderRadius: '8px', margin: '16px 0'}} />
+
+## Configuration
+
+MCP servers are declared in `~/.ante/settings.json` under the `mcp_servers` map. The key is the local server name; the value describes how to launch it.
+
+```json
+{
+  "mcp_servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_..." }
+    }
+  }
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `command` | Yes | Executable to spawn the server process |
+| `args` | No | Arguments passed to the command |
+| `env` | No | Environment variables set on the server process |
+| `enabled_tools` | No | Allowlist of raw tool names to expose. When empty or absent, all tools from the server are exposed |
+
+Only the **stdio** transport is supported — Ante spawns the command, speaks MCP over its stdin/stdout, and forwards stderr to the log.
+
+## Tool naming
+
+Each tool offered by a server is exposed to the agent as `mcp__<server>__<tool>`. Non-alphanumeric characters in either part are replaced with `_`, so a server keyed `my-server` with a tool named `do.thing` becomes `mcp__my_server__do_thing`.
+
+MCP tools are registered **after** `--allowed-tools` filtering, so a restrictive built-in allowlist will not strip them. Filter MCP tools per server with `enabled_tools`:
+
+```json
+{
+  "mcp_servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "enabled_tools": ["read_text_file", "write_file"]
+    }
+  }
+}
+```
+
+## Lifecycle
+
+MCP warm-up runs **lazily** in the background so the daemon stays responsive. When a session starts:
+
+1. `SessionStart` and the initial `ExtensionRefreshed` fire immediately — the input is usable right away.
+2. A background task connects to all configured servers in parallel (30-second handshake timeout each).
+3. As each server's tools are discovered they are added to the live tool registry; tools that come online become callable on the **next turn** (in-flight turns hold a frozen snapshot).
+4. A second `ExtensionRefreshed` is emitted once warm-up finishes so the `/mcp` panel populates with each server's discovered tool list.
+
+Progress is surfaced to the user via a grouped notification (an `InfoBlockStart` plus follow-up `InfoBlockAppend` events — see the [protocol reference](/reference/protocol-reference#infoblockstart)):
+
+```
+* Warming up 4 MCP servers in the background — tools will become available as they connect.
+  └ MCP ready: 4/4 servers connected, 60 tools registered.
+```
+
+Servers that fail to connect (or fail to list their tools) are logged, skipped, and reported as a child line under the warm-up block. Server processes are kept alive for the duration of the session and terminated when the daemon exits.
+
+## The `/mcp` command
+
+In the TUI, run `/mcp` to inspect configured servers. The selector lists each server with its connection status, exposed tool count, and command. Press `Enter` on a server to see per-tool details (description and parameters), or `d` to remove the server from `settings.json`.
+
+Adding new servers is done by editing `~/.ante/settings.json` directly; the selector does not currently include an in-TUI add flow.
+
+## Approval
+
+MCP tools do not require approval by default. Use `--disallowed-tools` or permission rules to gate specific tools if needed.

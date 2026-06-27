@@ -1,0 +1,23 @@
+---
+title: Models, Providers & Thinking
+description: "Switch models, toggle providers, and adjust thinking levels on the fly"
+---
+
+# Models, Providers & Thinking
+
+Ante lets you switch between models, providers, and reasoning levels mid-session — no restart needed.
+
+## Selecting a model
+
+Type `/model` in the TUI to open the model selector. You'll see available models grouped by provider. Use the arrow keys to navigate and Enter to confirm.
+
+<img src="/assets/cookbook/model.gif" alt="Selecting a model and provider with /model" style={{width: '100%', borderRadius: '8px', margin: '16px 0'}} />
+
+From this same interface you can:
+
+- **Switch providers** — press `Tab` to toggle between Anthropic, OpenAI, Gemini, Grok, and more
+- **Adjust thinking budget** — for models that support extended thinking (like Claude with thinking), configure how much reasoning the model should do before responding
+
+:::tip
+You can also set your default model and provider via CLI flags: `ante --provider openai --model gpt-5.5`, or configure defaults in your [preferences](/configuration/preference).
+:::

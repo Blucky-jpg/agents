@@ -1,0 +1,168 @@
+---
+title: Interactive TUI
+description: "Using Ante's rich terminal user interface"
+---
+
+Launch Ante without a prompt to enter the interactive TUI:
+
+```bash
+ante
+```
+
+## Overview
+
+The TUI is built with [ratatui](https://ratatui.rs/) and provides a rich chat interface directly in your terminal. It renders inline (up to 24 lines) and uses debounced rendering at approximately 100fps for smooth output.
+
+## Key features
+
+### Chat interface
+
+The main view shows a conversation between you and the agent. Type your prompt in the input area and press Enter to send. The agent's responses stream in real-time with markdown rendering.
+
+### Tool approval
+
+When the agent wants to execute a tool that requires approval (like `Bash` or `Write`), you'll see an approval prompt. Pick an option with the number keys or arrow keys + Enter:
+
+- **Yes** — allow this one call
+- **Yes, allow … for this session** — grant it for the rest of the run ([scoped](/configuration/permission#session-grants), not blanket)
+- **Yes, always allow … (save to settings)** — also persist an allow rule to `settings.json`
+- **No** — reject it; the agent will adjust its approach
+
+Press `Tab` to preview the proposed diff or request details before deciding.
+
+### Diff view
+
+When the agent proposes file edits, Ante switches to a fullscreen diff view on an alternate screen. You can review the exact changes before approving.
+
+### Model and provider selection
+
+Use the built-in selectors to switch models or providers during a session without restarting.
+
+### Theme selection
+
+Ante includes a theme system for consistent styling. Choose a theme through the theme dialog.
+
+## Slash commands
+
+The TUI supports built-in slash commands for common actions:
+
+| Command | Description |
+|---|---|
+| `/clear` | Clear conversation history |
+| `/init` | Initialize codebase analysis |
+| `/exit` | Exit (aliases: `exit`, `quit`) |
+| `/theme` | Open theme selection dialog |
+| `/diff` | Show git diff (including untracked files) |
+| `/connect` | Connect to a provider (OAuth) |
+| `/model` | Open model selector |
+| `/offline-mode` | Open offline model selector |
+| `/welcome` | Show onboarding/welcome dialog |
+| `/resume` | Resume a previous session in this directory |
+| `/statusline` | Configure the status line |
+| `/mcp` | Inspect and manage configured [MCP servers](/extend/mcp) |
+
+:::note
+Some commands are "visible" (appear in conversation history) and others are "silent" (execute without adding to history). `/clear`, `/init`, and `/exit` are visible; the rest are silent.
+:::
+
+Skills also appear as slash commands with scope indicators: `[p]` for project-level, `[u]` for user-level, and `[s]` for system-level skills.
+
+## Session resume
+
+Ante persists every session to disk. Use `/resume` to pick up a previous conversation where you left off.
+
+### How it works
+
+1. Type `/resume` to open the session picker
+2. Browse sessions scoped to the current working directory — each entry shows the first message, model, message count, and relative time
+3. Press **Enter** to select, or **Esc** to cancel
+
+On resume, Ante:
+- Restores the full conversation history
+- Re-discovers agents and skills in the project directory
+- Refreshes system prompts and tool definitions (so new features are available)
+- Replays up to 200 recent events so the TUI rebuilds the conversation view
+
+Sessions are stored in `~/.ante/sessions/{session_id}/` with atomic writes for crash safety.
+
+:::tip
+You can also resume from the CLI with `ante --resume <SESSION_ID>` (or `-r`) in either TUI or headless mode. The session ID is printed when a TUI session exits.
+:::
+
+## Keyboard shortcuts
+
+### Chat input
+
+| Key | Action |
+|---|---|
+| `Enter` | Send message |
+| `Ctrl+Enter` / `Alt+Enter` / `Shift+Enter` | Insert newline |
+| `Up` / `Down` | Move cursor, then navigate history |
+| `Tab` | Complete command or file path suggestion |
+| `Shift+Tab` | Cycle permission mode: `strict` → `auto` → `yolo` |
+| `Ctrl+R` | Start reverse-i-search through prompt history |
+| `Ctrl+C` | Interrupt the active turn; press twice in a row to exit (or use `/exit`, `exit`, `quit`) |
+| `Ctrl+S` | Steer queued messages into the running turn |
+| `Escape` | Close a popup, or interrupt the active turn when none is open |
+
+### Global shortcuts
+
+| Key | Action |
+|---|---|
+| `Ctrl+T` | Open theme dialog |
+| `Ctrl+E` | Stop running llama server (offline mode) |
+| `Ctrl+O` | Toggle local inference log panel |
+| `Ctrl+K` / `Ctrl+J` | Scroll inference log up/down |
+
+### Diff view (fullscreen)
+
+| Key | Action |
+|---|---|
+| `j` / `Down` | Scroll down |
+| `k` / `Up` | Scroll up |
+| `Page Down` / `Page Up` | Page scroll |
+| `Home` / `End` | Jump to top/bottom |
+| `q` / `Escape` | Close diff view |
+
+### Tool approval
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` (or `k` / `j`) | Move between options |
+| `1` / `2` / `3` / `4` | Pick Yes / for-session / always-allow / No directly |
+| `y` / `Enter` | Confirm the highlighted option |
+| `Esc` | Reject the tool call |
+| `Tab` | Preview the diff or request details |
+
+### Reverse search (Ctrl+R mode)
+
+| Key | Action |
+|---|---|
+| `Ctrl+R` | Next match |
+| `Ctrl+S` | Previous match |
+| `Enter` | Accept match |
+| `Escape` / `Ctrl+G` | Cancel search |
+
+## @ mentions
+
+Type `@` in the input to reference files or directories. A file search dropdown appears as you type:
+
+- `@path/to/file.rs` — embeds the file contents in your message
+- `@path/to/dir/` — embeds the directory tree listing
+
+:::tip
+If you paste multiple file paths, Ante auto-prefixes them with `@` for convenience.
+:::
+
+## CLI flags for TUI mode
+
+```bash
+ante --model claude-sonnet-4-6
+ante --provider openai
+ante --system-prompt "You are a Python expert"
+ante --append-system-prompt "Always use type hints"
+ante --allowed-tools Read Grep Glob
+ante --disallowed-tools Bash Write
+ante --yolo                       # skip all tool approvals
+ante --resume ses_01ARZ3NDEK...   # resume a previous session
+```

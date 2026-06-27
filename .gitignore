@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# Local SQLite databases (run data, contains local memory contents)
+*.db
+*.db.tmp
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Session state (not source code)
+/.kilo/

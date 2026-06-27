@@ -1,0 +1,89 @@
+---
+title: "Sub-Agents"
+description: "Delegate complex tasks to specialized sub-agents"
+---
+
+Sub-agents are specialized agents that the main agent can spawn to handle complex, multi-step tasks. Each sub-agent runs with its own prompt, tool set, and optional model override.
+
+## Built-in sub-agents
+
+Ante ships with three built-in sub-agents:
+
+### general
+
+A general-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. The main agent delegates to this when it needs to perform a search it isn't confident about completing in a few tries.
+
+### explorer
+
+A fast agent specialized for codebase exploration. It can quickly find files by patterns, search code for keywords, and answer structural questions about the codebase.
+
+### ante-guide
+
+An assistant for questions about Ante itself — features, configuration, the protocol, skills, and sub-agents. The main agent routes user questions about Ante's own functionality here.
+
+## Creating custom sub-agents
+
+Create a markdown file in `~/.ante/agents/` (user-level) or any of the project-level locations below with YAML frontmatter:
+
+```markdown
+---
+name: security-reviewer
+description: Reviews code for security vulnerabilities and OWASP top 10 issues
+tools:
+  - Read
+  - Grep
+  - Glob
+---
+
+You are a security-focused code reviewer. Analyze the provided code for:
+
+- Injection vulnerabilities (SQL, command, XSS)
+- Authentication and authorization flaws
+- Sensitive data exposure
+- Security misconfiguration
+- Known vulnerable dependencies
+
+Provide findings with severity ratings and remediation steps.
+```
+
+### Frontmatter fields
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | Yes | Unique identifier for the agent |
+| `description` | Yes | What this agent does (shown to the main agent for delegation decisions) |
+| `model` | No | Override the LLM model for this agent |
+| `tools` | No | Restrict which tools this agent can use |
+
+## How sub-agents work
+
+When the main agent encounters a task that matches a sub-agent's description, it uses the `Agent` tool to spawn the sub-agent:
+
+1. The main agent evaluates available sub-agents and their descriptions
+2. It delegates the task via the `Agent` tool with a detailed prompt
+3. The sub-agent runs independently with its own context
+4. The result is returned to the main agent, which incorporates it into the conversation
+
+```
+┌────────────┐     Agent     ┌──────────────┐
+│ Main Agent │ ────────────▶ │  Sub-Agent   │
+│            │ ◀──────────── │  (Explorer)  │
+│            │    Result     └──────────────┘
+│            │
+│            │     Agent     ┌──────────────┐
+│            │ ────────────▶ │  Sub-Agent   │
+│            │ ◀──────────── │  (General)   │
+└────────────┘    Result     └──────────────┘
+```
+
+## Discovery
+
+Sub-agents are discovered in precedence order (later overrides earlier by name):
+
+1. Built-in agents (`general`, `explorer`, `ante-guide`)
+2. `~/.ante/agents/` (user-level)
+3. `.agents/agents/` (project-level)
+4. `.ante/agents/` (project-level)
+5. `.claude/agents/` (project-level, Claude Code compatibility)
+
+User and project agents are loaded alongside the built-in ones. All available agents are registered at session initialization time and refreshed via the `ExtensionRefreshed` protocol event.

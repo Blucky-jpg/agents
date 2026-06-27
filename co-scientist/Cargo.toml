@@ -1,0 +1,43 @@
+[package]
+name = "co-scientist"
+version = "0.1.0"
+edition = "2024"
+description = "Co-scientist: external agent memory layer over ante. No ante fork required."
+
+[features]
+# Enables test-only escape hatches like `Memory::agent_id_for_test`.
+# Used by integration tests; off in production builds.
+test-helpers = []
+
+[dependencies]
+# Embedded SQLite via rusqlite (bundled). Replaces turso/libSQL — the DB lives
+# at $CO_SCIENTIST_DB (default ./co_scientist.db). rusqlite is sync; the
+# `db` module wraps it in `tokio::spawn_blocking` so call sites stay async.
+rusqlite = { workspace = true }
+# In-tree minimal `claude` CLI client (see src/claude_cli.rs). Replaces
+# the vendored ante-agent-sdk to drop its transitive dep graph
+# (notably turso_core via the agent-sdk).
+which = "7"
+
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+minijinja = { version = "2", features = ["loader"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"
+
+[[test]]
+name = "integration"
+required-features = ["test-helpers"]

@@ -1,0 +1,97 @@
+---
+title: "Tool Reference"
+description: "Reference for the tools available during an Ante session"
+---
+
+Tools are the capabilities available to the agent during a session. Some tools run silently; others require your approval before they execute, unless a permission rule says otherwise.
+
+## File I/O
+
+### Read
+
+Read text files, images, and PDFs.
+
+### Write
+
+Create or overwrite a file. Requires approval.
+
+### Edit
+
+Make exact string replacements in a file. Requires approval.
+
+### Glob
+
+Find files by glob pattern.
+
+### Grep
+
+Search file contents with regular expressions.
+
+## Shell
+
+### Bash
+
+Execute shell commands. Each call runs in a fresh non-interactive process — shell state does not persist between calls. Long-running commands (servers, watchers, slow builds) can be launched in the background; the agent gets back paths it can read for status and output, and can stop the process by its pid. A trailing `&` on a background command is redundant and is stripped automatically. Requires approval.
+
+## Builtin
+
+### Agent
+
+Spawn a sub-agent to handle a task autonomously. The agent picks which sub-agent to delegate to based on the task.
+
+### TodoWrite
+
+Track progress on multi-step work with a task list.
+
+### WebFetch
+
+Fetch a URL, convert it to markdown, and have a small model extract what's relevant. Requires approval.
+
+### WebSearch
+
+Search the web and return results with citations. Requires approval. Not in the default tool set — enable with `--allowed-tools`.
+
+## Opt-in tools
+
+These are not enabled by default. Turn them on with `--allowed-tools`, or use `--simple-agent` for an agent set tuned around interactive terminal work.
+
+### ImageRead
+
+Read and analyze an image with a natural-language instruction.
+
+### PTY
+
+Drive a persistent shared tmux session — useful for interactive programs and full-screen TUI apps where state needs to carry across calls. Requires `tmux`.
+
+### Browser
+
+Drive a Chromium browser for navigation, content extraction, and automation. The agent typically takes a snapshot of the page to find interactive elements, then clicks or types into them. Requires approval, and only available when Ante is built with the `browser` cargo feature.
+
+## MCP tools
+
+Tools provided by configured [MCP servers](/extend/mcp) are exposed to the agent as `mcp__<server>__<tool>`. They appear alongside built-in tools and behave identically from the agent's perspective. MCP tools are registered after `--allowed-tools` filtering so they are not stripped by a restrictive built-in allowlist.
+
+## Default tool set
+
+By default Ante enables `Read`, `Bash`, `Grep`, `Glob`, `TodoWrite`, `WebFetch`, `Edit`, `Write`, and `Agent`. `Browser` is also included when Ante is built with the `browser` feature.
+
+`WebSearch`, `ImageRead`, and `PTY` are opt-in.
+
+## Tool filtering
+
+Control which tools are available in a session:
+
+```bash
+# Only allow these tools
+ante --allowed-tools Read Glob Grep "analyze the code"
+
+# Remove these tools
+ante --disallowed-tools Bash Write "read-only analysis"
+```
+
+Supports ToolMatcher syntax for fine-grained control:
+
+```bash
+# Allow Bash but only for specific patterns
+ante --allowed-tools "Read" "Bash(cargo test)" "Bash(cargo clippy)"
+```

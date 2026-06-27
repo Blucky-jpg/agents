@@ -1,0 +1,645 @@
+---
+title: "Protocol Reference"
+description: "Complete reference for Ante's client-daemon message protocol, wire format, and type definitions"
+---
+
+Ante uses a typed message-passing protocol between the client and daemon. Messages are exchanged over bounded async channels (in-process) or as JSON Lines over stdin/stdout (external clients).
+
+## Wire format
+
+External clients communicate with the daemon using **JSON Lines** (JSONL) — one JSON object per line over stdin/stdout.
+
+- **Client → Daemon**: Send `OpMsg` objects as JSON lines to stdin
+- **Daemon → Client**: Receive `EventMsg` objects as JSON lines from stdout
+
+### OpMsg envelope
+
+Every operation is wrapped in an `OpMsg`:
+
+```json
+{
+  "op": { "StartSession": { "model": "claude-sonnet-4-6", "provider": "anthropic" } },
+  "id": "op_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+}
+```
+
+### EventMsg envelope
+
+Every event is wrapped in an `EventMsg`:
+
+```json
+{
+  "timestamp": "2025-06-01T12:00:00Z",
+  "id": "evt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "event": { "AgentMessage": "Here is the result..." },
+  "parent": "op_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+}
+```
+
+The `parent` field links an event back to the operation that triggered it. It is `null` when not applicable.
+
+## Message IDs
+
+Every message has a typed `Id` consisting of a prefix (up to 4 bytes) and a [ULID](https://github.com/ulid/spec). The string format is `{prefix}_{ulid}`.
+
+| Prefix | Usage |
+|---|---|
+| `op_` | Operations (client → daemon) |
+| `evt_` | Events (daemon → client) |
+| `ses_` | Session identifiers |
+| `step_` | Step identifiers |
+
+Example: `op_01J5A3B7C9D0E1F2G3H4J5K6M7`
+
+## Operations (Client → Daemon)
+
+### StartSession
+
+Initialize a new session with model, provider, and configuration.
+
+```json
+{
+  "op": {
+    "StartSession": {
+      "model": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "permission_mode": null,
+      "system_prompt": null,
+      "append_system_prompt": null,
+      "allowed_tools": null,
+      "disallowed_tools": null,
+      "cwd": null,
+      "thinking": null
+    }
+  },
+  "id": "op_..."
+}
+```
+
+**SessionConfig fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `model` | `string` | Model name (e.g. `"claude-sonnet-4-6"`) |
+| `provider` | `string` | Provider name (e.g. `"anthropic"`, `"openai"`, `"gemini"`, `"xai"`, `"openrouter"`, `"local"`) |
+| `permission_mode` | `PermissionMode?` | Tool approval mode: `"strict"`, `"auto"`, or `"yolo"`. `null` uses `strict` |
+| `system_prompt` | `string?` | Override the default system prompt entirely |
+| `append_system_prompt` | `string?` | Append content to the default system prompt |
+| `allowed_tools` | `string[]?` | Whitelist — only these tools are available |
+| `disallowed_tools` | `string[]?` | Blacklist — these tools are removed |
+| `cwd` | `string?` | Working directory. Defaults to daemon's process directory |
+| `thinking` | `Thinking?` | Thinking level override: `"Disabled"`, `"Enabled"`, `"Deep"`, or `"Max"` |
+
+### UpdateSession
+
+Update the active session without restarting it (e.g. switch models or permission mode mid-session). Each field is optional; an absent field is left unchanged. Both apply on the next turn without disturbing an in-flight one — the permission mode change is what `Shift+Tab` cycling sends from the TUI. Other session options must be set at `StartSession` time.
+
+```json
+{
+  "op": {
+    "UpdateSession": {
+      "model": { "name": "gpt-5.4", "temperature": 0.2 },
+      "permission_mode": "auto"
+    }
+  },
+  "id": "op_..."
+}
+```
+
+**SessionUpdate fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `model` | `ModelSpec?` | New model specification to use |
+| `permission_mode` | `PermissionMode?` | New permission mode (`"strict"`, `"auto"`, or `"yolo"`) |
+
+### ResumeSession
+
+Resume a previously persisted session by its ID. The daemon restores the conversation history, re-discovers extensions, and replays recent events so the client can rebuild its view.
+
+```json
+{ "op": { "ResumeSession": { "session_id": "ses_01ARZ..." } }, "id": "op_..." }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `session_id` | `Id` | The session identifier to resume |
+
+On success the daemon emits `SessionEnd` for the current session (if any), then `SessionStart` and `ExtensionRefreshed` for the resumed session, followed by up to 200 replayed historical events. On failure it emits an `Error` event.
+
+### Steer
+
+Provide additional guidance to the agent during an active turn without starting a new one.
+
+```json
+{ "op": { "Steer": "focus on the auth module first" }, "id": "op_..." }
+```
+
+### UserInput
+
+Submit user text input to the agent.
+
+```json
+{ "op": { "UserInput": "explain what this project does" }, "id": "op_..." }
+```
+
+### ApprovalResponse
+
+Respond to a tool approval request (sent after receiving a `TurnPause` event with `Approval` reason).
+
+```json
+{
+  "op": {
+    "ApprovalResponse": {
+      "turn_id": "step_01ARZ...",
+      "responses": [
+        ["tool_use_abc123", "Accept"],
+        ["tool_use_def456", "Skip"]
+      ]
+    }
+  },
+  "id": "op_..."
+}
+```
+
+**ReviewDecision values:**
+
+| Decision | Description |
+|---|---|
+| `Accept` | Allow this tool call |
+| `Skip` | Skip this tool call |
+| `AcceptForSession` | Grant this call for the rest of the session (scoped — see [Session grants](/configuration/permission#session-grants)) |
+| `AcceptAlways` | Grant for the session and persist an allow rule to `settings.json` ("always allow") |
+| `Abort` | Abort the current task |
+
+### SlashCommand
+
+Invoke a skill by name.
+
+```json
+{ "op": { "SlashCommand": { "name": "commit", "args": "-m 'fix bug'" } }, "id": "op_..." }
+```
+
+### Interrupt
+
+Abort whatever is currently running.
+
+```json
+{ "op": "Interrupt", "id": "op_..." }
+```
+
+### Shutdown
+
+Request a graceful shutdown.
+
+```json
+{ "op": "Shutdown", "id": "op_..." }
+```
+
+### RegisterLocalProvider
+
+Register a running local inference server (e.g. an offline `llama-server` started by the client) as the `local` provider for this daemon. The model is optional — if provided, it pins the local provider to a specific `ModelSpec`; otherwise the local provider serves whatever model the server is hosting.
+
+```json
+{
+  "op": {
+    "RegisterLocalProvider": {
+      "port": 8080,
+      "model": null
+    }
+  },
+  "id": "op_..."
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `port` | `u16` | Port the local llama-server is listening on |
+| `model` | `ModelSpec?` | Optional model spec to pin the provider to |
+
+### RestoreLocalProvider
+
+Restore the previously registered local provider configuration after a session-level provider switch. Useful when the daemon needs to revert to a previously registered local server without re-supplying its port and model.
+
+```json
+{ "op": "RestoreLocalProvider", "id": "op_..." }
+```
+
+## Events (Daemon → Client)
+
+### Session events
+
+#### SessionStart
+
+Emitted when a session is initialized. Contains metadata about the active model, provider, session ID, and working directory. Skills and subagents are delivered separately via `ExtensionRefreshed`.
+
+```json
+{
+  "event": {
+    "SessionStart": {
+      "model": { "name": "claude-sonnet-4-6", "max_tokens": 8192 },
+      "provider": "anthropic",
+      "session_id": "ses_01ARZ...",
+      "cwd": "/home/user/project",
+      "permission_mode": "strict"
+    }
+  }
+}
+```
+
+**SessionInitialized fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `model` | `ModelSpec` | Active model specification |
+| `provider` | `string` | Active provider name (e.g. `"anthropic"`) |
+| `session_id` | `Id` | Unique session identifier |
+| `cwd` | `string` | Working directory path |
+| `permission_mode` | `PermissionMode` | Active permission mode (`"strict"`, `"auto"`, or `"yolo"`) |
+
+#### SessionUpdated
+
+Emitted when the active session is updated in place (e.g. model changed via `UpdateSession`).
+
+```json
+{
+  "event": {
+    "SessionUpdated": {
+      "model": { "name": "gpt-5.4" },
+      "provider": "openai",
+      "session_id": "ses_01ARZ...",
+      "cwd": "/home/user/project"
+    }
+  }
+}
+```
+
+#### SessionEnd
+
+Emitted when the session terminates.
+
+```json
+{ "event": "SessionEnd" }
+```
+
+### Turn lifecycle events
+
+#### TurnStart
+
+Emitted when a new turn begins processing.
+
+```json
+{ "event": { "TurnStart": { "turn_id": "step_01ARZ..." } } }
+```
+
+#### TurnPause
+
+Emitted when a turn is paused waiting for user input (e.g. tool approval).
+
+```json
+{
+  "event": {
+    "TurnPause": {
+      "turn_id": "step_01ARZ...",
+      "reason": {
+        "Approval": {
+          "tools": [
+            { "id": "tool_use_abc123", "name": "Bash", "input": { "command": "ls -la" } }
+          ],
+          "message": "Allow running shell command?"
+        }
+      }
+    }
+  }
+}
+```
+
+**TurnPauseReason variants:**
+
+| Variant | Fields | Description |
+|---|---|---|
+| `Approval` | `tools: ToolUse[]`, `message: string` | Waiting for tool approval |
+
+#### TurnEnd
+
+Emitted when a turn completes.
+
+```json
+{ "event": { "TurnEnd": { "turn_id": "step_01ARZ...", "status": "Completed" } } }
+```
+
+**TurnEndStatus variants:**
+
+| Variant | Fields | Description |
+|---|---|---|
+| `Completed` | — | Turn finished successfully |
+| `Interrupted` | `reason?: string` | Turn was interrupted |
+| `Error` | `message: string` | Turn ended with an error |
+
+### Message streaming events
+
+#### AgentMessage
+
+Complete agent text response (non-streaming).
+
+```json
+{ "event": { "AgentMessage": "The project is a web server that..." } }
+```
+
+#### Thinking
+
+Complete chain-of-thought block (non-streaming).
+
+```json
+{ "event": { "Thinking": "Let me analyze the codebase structure..." } }
+```
+
+#### MessageDelta
+
+Streaming chunk of the agent's message. Concatenate all deltas to build the full message.
+
+```json
+{ "event": { "MessageDelta": "The project" } }
+```
+
+#### ThinkingDelta
+
+Streaming chunk of the agent's thinking. Concatenate all deltas to build the full thinking block.
+
+```json
+{ "event": { "ThinkingDelta": "Let me" } }
+```
+
+### Tool events
+
+#### ToolStart
+
+Emitted when a tool invocation begins.
+
+```json
+{
+  "event": {
+    "ToolStart": {
+      "id": "tool_use_abc123",
+      "name": "Read",
+      "input": { "file_path": "/src/main.rs" }
+    }
+  }
+}
+```
+
+#### ToolUpdate
+
+Progress update during tool execution.
+
+```json
+{
+  "event": {
+    "ToolUpdate": {
+      "tool_use_id": "tool_use_abc123",
+      "seq": 0,
+      "message": "Reading file..."
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `tool_use_id` | `string` | Tool call identifier (matches `ToolStart.id`) |
+| `seq` | `u64` | Monotonically increasing sequence number |
+| `message` | `string` | Progress message |
+
+#### ToolEnd
+
+Emitted when a tool execution completes.
+
+```json
+{
+  "event": {
+    "ToolEnd": {
+      "tool_use_id": "tool_use_abc123",
+      "status": "Completed",
+      "result_json": { "content": "fn main() { ... }" },
+      "is_error": false
+    }
+  }
+}
+```
+
+**ToolEndStatus variants:**
+
+| Variant | Description |
+|---|---|
+| `Completed` | Tool ran successfully |
+| `Cancelled` | Tool execution was cancelled |
+| `Denied` | Tool was denied by the user |
+| `Failed` | Tool execution failed |
+
+### Compaction events
+
+#### CompactStart
+
+Emitted when dialog compaction begins.
+
+```json
+{ "event": "CompactStart" }
+```
+
+#### CompactEnd
+
+Emitted when dialog compaction completes.
+
+```json
+{ "event": "CompactEnd" }
+```
+
+### Extension events
+
+#### ExtensionRefreshed
+
+Emitted when skills, subagents, or MCP servers are refreshed. Sent at least twice during a normal session: once right after `SessionStart` with the initial skills/subagents (and `mcp_servers: []`), and again after MCP warm-up completes in the background with the discovered server and tool list.
+
+```json
+{
+  "event": {
+    "ExtensionRefreshed": {
+      "session_id": "ses_01ARZ...",
+      "skills": [
+        { "name": "commit", "description": "Create a git commit", "scope": "user", "argument_hint": "-m 'message'" }
+      ],
+      "subagents": [
+        { "name": "explore", "description": "Explore the codebase", "scope": "project" }
+      ],
+      "mcp_servers": [
+        {
+          "name": "filesystem",
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+          "tools": [
+            {
+              "name": "read_text_file",
+              "qualified_name": "mcp__filesystem__read_text_file",
+              "description": "Read the contents of a text file",
+              "parameters": [
+                { "name": "path", "param_type": "string", "required": true, "description": "Path to the file" }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+Each entry in `mcp_servers` reflects what was actually launched and discovered: the `tools` list is empty for servers that failed to connect, and `qualified_name` is the `mcp__<server>__<tool>` form the agent uses to call the tool.
+
+### Informational events
+
+#### UsageUpdate
+
+Token usage statistics for the session. `context` is omitted before the first response or when the model context limit is unknown. `pct_used` is measured against the auto-compact threshold, so it can reach 100% before the raw token limit.
+
+```json
+{
+  "event": {
+    "UsageUpdate": {
+      "usage": { "input_tokens": 1500, "output_tokens": 300 },
+      "context": { "used_tokens": 1800, "limit_tokens": 200000, "pct_used": 1 }
+    }
+  }
+}
+```
+
+#### Info
+
+General informational message.
+
+```json
+{ "event": { "Info": "Compacting conversation history..." } }
+```
+
+#### InfoBlockStart
+
+Opens a grouped Info entry with a header. Subsequent `InfoBlockAppend` events sharing the same `id` render as tree-indented child lines under it — used for multi-step background notifications (e.g. MCP warm-up) that should visually cluster.
+
+```json
+{
+  "event": {
+    "InfoBlockStart": {
+      "id": "mcp-warmup-ses_01ARZ...",
+      "header": "Warming up 4 MCP servers in the background — tools will become available as they connect."
+    }
+  }
+}
+```
+
+#### InfoBlockAppend
+
+Appends a child detail line to the `InfoBlockStart` with the same `id`. Drops silently if the matching block isn't present.
+
+```json
+{
+  "event": {
+    "InfoBlockAppend": {
+      "id": "mcp-warmup-ses_01ARZ...",
+      "detail": "MCP ready: 4/4 servers connected, 60 tools registered."
+    }
+  }
+}
+```
+
+#### Error
+
+Error message.
+
+```json
+{ "event": { "Error": "Authentication failed: invalid API key" } }
+```
+
+#### Goodbye
+
+Final message before the daemon disconnects. After receiving this, no more events will be sent.
+
+```json
+{ "event": "Goodbye" }
+```
+
+#### UserInput
+
+User input recorded for session replay. This variant is written to the persisted event log but is **not** emitted during live sessions — you will only see it in events replayed by `ResumeSession`.
+
+```json
+{ "event": { "UserInput": "explain what this project does" } }
+```
+
+### Offline mode and the protocol
+
+Local-model management (engine installation, model discovery, llama-server lifecycle) is **client-side**. It is driven through the in-process `OfflineSubsystem` API, not through the daemon protocol. The only daemon-facing surface for offline mode is `RegisterLocalProvider` / `RestoreLocalProvider` — the client starts a llama-server itself, then registers its port (and an optional `ModelSpec`) with the daemon.
+
+See the [Offline Mode](/experimental/offline) page for the user-facing flows and the `--offline-model` CLI flag.
+
+## Transport
+
+### In-process channels
+
+When the client and daemon run in the same process (TUI or headless mode), they communicate via bounded Tokio mpsc channels:
+
+| Channel | Direction | Buffer size |
+|---|---|---|
+| Op channel | Client → Daemon | 256 messages |
+| Event channel | Daemon → Client | 4096 messages |
+
+### Stdio transport (JSONL)
+
+For external clients using `ante serve` (or `ante serve --stdio`), `StdioTransport` bridges JSON Lines over stdin/stdout to the internal channel pair:
+
+- **stdin** → Parse each line as `OpMsg` → forward to daemon
+- **daemon events** → Serialize as JSON → write to **stdout** (one line per event)
+- **EOF on stdin** → Automatically sends `Op::Shutdown`
+- **`Evt::Goodbye` received** → Transport exits
+- **JSON parse errors** → An `Evt::Error` is sent back on stdout
+
+### WebSocket transport
+
+For networked or browser-based clients using `ante serve --ws <ADDR>`, `WsTransport` exchanges the same JSONL protocol over WebSocket frames:
+
+- Each WebSocket connection gets its own daemon instance
+- Messages are the same `OpMsg` and `EventMsg` JSON objects, sent as text frames
+- **Client disconnect** → Daemon instance shuts down, server accepts next connection
+- **`Op::Shutdown` received** → Connection and server both exit
+- The server loops accepting new connections until a `Shutdown` is received
+
+## Complete flow example
+
+A full session lifecycle from start to shutdown:
+
+```
+Client                                  Daemon
+  │                                       │
+  │─── OpMsg { StartSession(...) } ──────▶│
+  │◀── EventMsg { SessionStart(...) } ────│
+  │                                       │
+  │─── OpMsg { UserInput("fix bug") } ───▶│
+  │◀── EventMsg { TurnStart { turn_id } } │
+  │◀── EventMsg { ThinkingDelta("...") }  │
+  │◀── EventMsg { ThinkingDelta("...") }  │
+  │◀── EventMsg { Thinking("...") }       │
+  │◀── EventMsg { MessageDelta("...") }   │
+  │◀── EventMsg { ToolStart(ToolUse) }    │
+  │◀── EventMsg { TurnPause(Approval) }   │
+  │                                       │
+  │─── OpMsg { ApprovalResponse(...) } ──▶│
+  │◀── EventMsg { ToolUpdate(...) }       │
+  │◀── EventMsg { ToolEnd(...) }          │
+  │◀── EventMsg { MessageDelta("...") }   │
+  │◀── EventMsg { AgentMessage("...") }   │
+  │◀── EventMsg { UsageUpdate(...) }      │
+  │◀── EventMsg { TurnEnd(Completed) }    │
+  │                                       │
+  │─── OpMsg { Shutdown } ───────────────▶│
+  │◀── EventMsg { SessionEnd }            │
+  │◀── EventMsg { Goodbye }               │
+  │                                       │
+```
