@@ -103,7 +103,7 @@ fn on_turn_started(state: &mut AppState, model: String) {
 /// markers until `TurnDone` arrives. `scrub_markers` is a pure
 /// function in `main.rs` (C3 candidate for its own module).
 fn on_turn_delta(state: &mut AppState, agent_name: String, delta: String) {
-    let scrubbed = crate::scrub_markers(&mut state.partial_marker_carry, &delta);
+    let scrubbed = crate::marker_scrubber::scrub(&mut state.partial_marker_carry, &delta);
     if let Some(idx) = state.streaming_assistant
         && let Some(ChatMsg::Assistant { agent, text }) = state.log.get_mut(idx)
     {
