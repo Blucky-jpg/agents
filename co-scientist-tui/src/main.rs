@@ -157,6 +157,17 @@ async fn run_app(terminal: &mut Term, db_path: PathBuf) -> Result<()> {
 
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
+    // Latest chat-panel metrics, owned by the event loop. `ui::draw`
+    // updates this every frame; the input handler reads from it on
+    // the next key event. Replaces the old `AppState::chat_max_scroll`
+    // / `chat_visible_h` fields that the draw path used to write
+    // back onto state (C6, 2026-06-28).
+    let mut last_metrics: ui::ChatMetrics = ui::ChatMetrics {
+        total: 0,
+        visible_h: 0,
+        max_scroll: 0,
+    };
+
     loop {
         while let Ok(msg) = rx_to_ui.try_recv() {
             handle_agent_msg(&state, msg).await;
@@ -164,7 +175,16 @@ async fn run_app(terminal: &mut Term, db_path: PathBuf) -> Result<()> {
 
         {
             let mut s = state.lock().await;
-            terminal.draw(|f| ui::draw(f, &mut s))?;
+            // `terminal.draw`'s closure must return `()`, so we route
+            // the metrics out through a `Cell`. Same thread, no
+            // contention — the cell is just a return-value channel.
+            let metrics_cell = std::cell::Cell::new(None);
+            terminal.draw(|f| {
+                metrics_cell.set(ui::draw(f, &mut s));
+            })?;
+            if let Some(m) = metrics_cell.into_inner() {
+                last_metrics = m;
+            }
             drop(s);
         }
 
@@ -182,14 +202,14 @@ async fn run_app(terminal: &mut Term, db_path: PathBuf) -> Result<()> {
             // one row down from the top instead of from where the user
             // was visually anchored.
             if s.follow_tail {
-                s.chat_scroll = s.chat_max_scroll;
+                s.chat_scroll = last_metrics.max_scroll as u16;
             }
         }
 
         let event_ready = event::poll(Duration::from_millis(50))?;
         if event_ready
             && let Event::Key(key) = event::read()?
-            && handle_key(&state, key, &tx_to_agent).await?
+            && handle_key(&state, key, &tx_to_agent, &last_metrics).await?
         {
             let _ = tx_to_agent.send(UiToAgent::Shutdown);
             break;
@@ -210,6 +230,7 @@ async fn handle_key(
     state: &SharedState,
     key: KeyEvent,
     tx: &mpsc::UnboundedSender<UiToAgent>,
+    metrics: &ui::ChatMetrics,
 ) -> Result<bool> {
     let mut s = state.lock().await;
 
@@ -263,7 +284,7 @@ async fn handle_key(
                 return Ok(true);
             }
         }
-        Focus::Chat => handle_key_chat(&mut s, key),
+        Focus::Chat => handle_key_chat(&mut s, key, metrics),
         Focus::Agents => handle_key_agents(&mut s, key),
         Focus::SidebarTasks | Focus::SidebarMemory => handle_key_sidebar(&mut s, key),
     }
@@ -396,12 +417,16 @@ fn handle_key_input(
     Ok(false)
 }
 
-fn handle_key_chat(s: &mut AppState, key: KeyEvent) {
+fn handle_key_chat(s: &mut AppState, key: KeyEvent, metrics: &ui::ChatMetrics) {
     // Page-scroll unit: one screen minus one row. Using a fixed 10 was a
     // UX bug — on a 30-row chat panel it scrolled less than half a screen.
-    // `visible_h` is updated by `draw_chat` every frame; when it's 0 the
-    // chat hasn't rendered yet, fall back to 1 so `j` still does something.
-    let page = s.chat_visible_h.saturating_sub(1).max(1) as i32;
+    // `metrics.visible_h` is updated by `draw_chat` every frame; when
+    // it's 0 the chat hasn't rendered yet, fall back to 1 so `j` still
+    // does something. Before C6 these came from `s.chat_visible_h` /
+    // `s.chat_max_scroll` (written by the draw path back onto state);
+    // the event loop now owns them and passes them in directly.
+    let page = metrics.visible_h.saturating_sub(1).max(1) as i32;
+    let max_scroll = metrics.max_scroll as u16;
     // Helper: when leaving follow-tail mode, anchor `chat_scroll` to the
     // current bottom so the next `j`/`PageDown` scrolls *from* the bottom
     // by one (not from 0 + 1 = clamped-to-bottom). Without this anchor,
@@ -410,7 +435,7 @@ fn handle_key_chat(s: &mut AppState, key: KeyEvent) {
     // user just left.
     let leave_tail = |s: &mut AppState| {
         if s.follow_tail {
-            s.chat_scroll = s.chat_max_scroll;
+            s.chat_scroll = max_scroll;
             s.follow_tail = false;
         }
     };
@@ -419,7 +444,7 @@ fn handle_key_chat(s: &mut AppState, key: KeyEvent) {
         KeyCode::BackTab => s.cycle_focus(-1),
         KeyCode::Char('j') | KeyCode::Down => {
             leave_tail(s);
-            s.chat_scroll = s.chat_scroll.saturating_add(1).min(s.chat_max_scroll);
+            s.chat_scroll = s.chat_scroll.saturating_add(1).min(max_scroll);
         }
         KeyCode::Char('k') | KeyCode::Up => {
             leave_tail(s);
@@ -428,7 +453,7 @@ fn handle_key_chat(s: &mut AppState, key: KeyEvent) {
         KeyCode::PageDown => {
             leave_tail(s);
             let next = (s.chat_scroll as i32 + page).max(0) as u32;
-            s.chat_scroll = (next as u16).min(s.chat_max_scroll);
+            s.chat_scroll = (next as u16).min(max_scroll);
         }
         KeyCode::PageUp => {
             leave_tail(s);
@@ -444,7 +469,7 @@ fn handle_key_chat(s: &mut AppState, key: KeyEvent) {
             // Pin immediately so a subsequent `j` (which calls
             // `leave_tail`) anchors to the right place without an extra
             // draw frame.
-            s.chat_scroll = s.chat_max_scroll;
+            s.chat_scroll = max_scroll;
         }
         KeyCode::Char('g') => {
             s.follow_tail = false;
@@ -453,12 +478,12 @@ fn handle_key_chat(s: &mut AppState, key: KeyEvent) {
         KeyCode::Char('f') => {
             s.follow_tail = !s.follow_tail;
             if s.follow_tail {
-                s.chat_scroll = s.chat_max_scroll;
+                s.chat_scroll = max_scroll;
             }
         }
         KeyCode::End => {
             s.follow_tail = true;
-            s.chat_scroll = s.chat_max_scroll;
+            s.chat_scroll = max_scroll;
         }
         KeyCode::Home => {
             s.follow_tail = false;
@@ -662,17 +687,27 @@ mod scroll_tests {
 
     use super::handle_key_chat;
     use crate::app::{AppState, ChatMsg};
+    use crate::ui::ChatMetrics;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    fn state(max_scroll: u16, visible_h: u16) -> AppState {
+    /// Build a (state, metrics) pair for testing. Before C6 the
+    /// metrics lived on `AppState` (the draw path wrote them back
+    /// onto state); now they're a parameter to `handle_key_chat`.
+    fn state_with_metrics(max_scroll: u16, visible_h: u16) -> (AppState, ChatMetrics) {
         let mut s = AppState::new("test-run".into());
         // Simulate a chat with enough content to be scrollable.
         for i in 0..50 {
             s.log.push(ChatMsg::User(format!("message {i}")));
         }
-        s.chat_max_scroll = max_scroll;
-        s.chat_visible_h = visible_h;
-        s
+        let metrics = ChatMetrics {
+            // `total` doesn't affect these tests; any positive value
+            // works. 50 lines is consistent with the log we just
+            // pushed.
+            total: 50,
+            visible_h: visible_h as usize,
+            max_scroll: max_scroll as usize,
+        };
+        (s, metrics)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -681,20 +716,20 @@ mod scroll_tests {
 
     #[test]
     fn g_goes_to_top() {
-        let mut s = state(100, 20);
+        let (mut s, m) = state_with_metrics(100, 20);
         s.chat_scroll = 80;
         s.follow_tail = false;
-        handle_key_chat(&mut s, key(KeyCode::Char('g')));
+        handle_key_chat(&mut s, key(KeyCode::Char('g')), &m);
         assert!(!s.follow_tail, "g should leave tail mode");
         assert_eq!(s.chat_scroll, 0, "g should pin scroll to top");
     }
 
     #[test]
     fn capital_g_goes_to_bottom_and_enters_tail_mode() {
-        let mut s = state(100, 20);
+        let (mut s, m) = state_with_metrics(100, 20);
         s.chat_scroll = 0;
         s.follow_tail = false;
-        handle_key_chat(&mut s, key(KeyCode::Char('G')));
+        handle_key_chat(&mut s, key(KeyCode::Char('G')), &m);
         assert!(s.follow_tail, "G should enter tail mode");
         assert_eq!(s.chat_scroll, 100, "G should pin scroll to max_scroll");
     }
@@ -710,10 +745,10 @@ mod scroll_tests {
         // is genuinely at the bottom and `j` either moves down by 1
         // (when new content arrived) or stays at the bottom (when it
         // didn't). Either way, the position is meaningful.
-        let mut s = state(100, 20);
+        let (mut s, m) = state_with_metrics(100, 20);
         s.follow_tail = true;
         s.chat_scroll = 0; // the bogus value the main loop used to write
-        handle_key_chat(&mut s, key(KeyCode::Char('j')));
+        handle_key_chat(&mut s, key(KeyCode::Char('j')), &m);
         assert!(!s.follow_tail, "j should leave tail mode");
         // 100 (anchor) + 1 = 101, clamped to 100. The user stays at the
         // bottom because there's nothing below them — that's correct.
@@ -725,20 +760,20 @@ mod scroll_tests {
         // Sanity check: j from row 40 in a log with max 100 should land
         // at row 41. Without the `leave_tail` anchor, this would still
         // work — the anchor only matters when leaving tail mode from 0.
-        let mut s = state(100, 20);
+        let (mut s, m) = state_with_metrics(100, 20);
         s.follow_tail = false;
         s.chat_scroll = 40;
-        handle_key_chat(&mut s, key(KeyCode::Char('j')));
+        handle_key_chat(&mut s, key(KeyCode::Char('j')), &m);
         assert_eq!(s.chat_scroll, 41);
     }
 
     #[test]
     fn page_down_unit_equals_visible_h_minus_one() {
         // Bug 3 regression: PageDown scrolled by 10 regardless of panel.
-        let mut s = state(200, 30);
+        let (mut s, m) = state_with_metrics(200, 30);
         s.chat_scroll = 0;
         s.follow_tail = false;
-        handle_key_chat(&mut s, key(KeyCode::PageDown));
+        handle_key_chat(&mut s, key(KeyCode::PageDown), &m);
         // page = visible_h - 1 = 29, clamped to max_scroll = 200.
         assert_eq!(s.chat_scroll, 29);
     }
@@ -746,44 +781,44 @@ mod scroll_tests {
     #[test]
     fn page_down_clamps_at_max_scroll() {
         // Bug 4 regression: PageDown walked the value to u16::MAX across
-        // many presses. Now it clamps at chat_max_scroll.
-        let mut s = state(50, 20);
+        // many presses. Now it clamps at max_scroll.
+        let (mut s, m) = state_with_metrics(50, 20);
         s.chat_scroll = 45;
         s.follow_tail = false;
         for _ in 0..100 {
-            handle_key_chat(&mut s, key(KeyCode::PageDown));
+            handle_key_chat(&mut s, key(KeyCode::PageDown), &m);
         }
         assert_eq!(s.chat_scroll, 50, "PageDown should clamp at max_scroll, not saturate");
     }
 
     #[test]
     fn j_clamps_at_max_scroll() {
-        let mut s = state(50, 20);
+        let (mut s, m) = state_with_metrics(50, 20);
         s.chat_scroll = 50;
         s.follow_tail = false;
-        handle_key_chat(&mut s, key(KeyCode::Char('j')));
+        handle_key_chat(&mut s, key(KeyCode::Char('j')), &m);
         assert_eq!(s.chat_scroll, 50, "j should not exceed max_scroll");
     }
 
     #[test]
     fn k_clamps_at_zero() {
-        let mut s = state(50, 20);
+        let (mut s, m) = state_with_metrics(50, 20);
         s.chat_scroll = 0;
         s.follow_tail = false;
-        handle_key_chat(&mut s, key(KeyCode::Char('k')));
+        handle_key_chat(&mut s, key(KeyCode::Char('k')), &m);
         assert_eq!(s.chat_scroll, 0, "k should not underflow");
     }
 
     #[test]
     fn f_toggles_follow_tail_and_anchors_when_entering() {
-        let mut s = state(100, 20);
+        let (mut s, m) = state_with_metrics(100, 20);
         s.chat_scroll = 5;
         s.follow_tail = false;
-        handle_key_chat(&mut s, key(KeyCode::Char('f')));
+        handle_key_chat(&mut s, key(KeyCode::Char('f')), &m);
         assert!(s.follow_tail, "f should enter tail mode");
         assert_eq!(s.chat_scroll, 100, "entering tail should pin to max_scroll");
 
-        handle_key_chat(&mut s, key(KeyCode::Char('f')));
+        handle_key_chat(&mut s, key(KeyCode::Char('f')), &m);
         assert!(!s.follow_tail, "second f should leave tail mode");
         assert_eq!(
             s.chat_scroll, 100,
@@ -793,14 +828,14 @@ mod scroll_tests {
 
     #[test]
     fn home_end_keys_match_vim_conventions() {
-        let mut s = state(100, 20);
+        let (mut s, m) = state_with_metrics(100, 20);
         s.chat_scroll = 50;
         s.follow_tail = false;
-        handle_key_chat(&mut s, key(KeyCode::Home));
+        handle_key_chat(&mut s, key(KeyCode::Home), &m);
         assert_eq!(s.chat_scroll, 0);
         assert!(!s.follow_tail);
 
-        handle_key_chat(&mut s, key(KeyCode::End));
+        handle_key_chat(&mut s, key(KeyCode::End), &m);
         assert!(s.follow_tail);
         assert_eq!(s.chat_scroll, 100);
     }
@@ -810,10 +845,10 @@ mod scroll_tests {
         // Defensive: if metrics haven't been published yet (chat panel
         // hasn't rendered), page should still do something instead of
         // dividing by zero or no-op'ing.
-        let mut s = state(100, 0);
+        let (mut s, m) = state_with_metrics(100, 0);
         s.chat_scroll = 0;
         s.follow_tail = false;
-        handle_key_chat(&mut s, key(KeyCode::PageDown));
+        handle_key_chat(&mut s, key(KeyCode::PageDown), &m);
         assert_eq!(s.chat_scroll, 1, "fallback page unit should be 1, not 0");
     }
 }

@@ -88,26 +88,26 @@ const ROUNDED: Borders = Borders::ALL;
 // are always rounded in v0.29's default border set when both left+right
 // and top+bottom are set. We use Borders::ALL and trust the default.
 
-pub fn draw(f: &mut Frame, state: &mut AppState) {
+pub fn draw(f: &mut Frame, state: &mut AppState) -> Option<ChatMetrics> {
     let area = f.area();
 
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         draw_too_small(f, area, state);
-        return;
+        return None;
     }
 
     if state.show_help {
-        draw_main(f, state);
+        let m = draw_main(f, state);
         draw_help_overlay(f, area);
-        return;
+        return m;
     }
 
     if state.show_splash {
         splash::draw(f, area, state);
-        return;
+        return None;
     }
 
-    draw_main(f, state);
+    draw_main(f, state)
 }
 
 fn draw_too_small(f: &mut Frame, area: Rect, state: &mut AppState) {
@@ -142,7 +142,7 @@ fn draw_too_small(f: &mut Frame, area: Rect, state: &mut AppState) {
 
 // -- main layout -----------------------------------------------------------
 
-fn draw_main(f: &mut Frame, state: &mut AppState) {
+fn draw_main(f: &mut Frame, state: &mut AppState) -> Option<ChatMetrics> {
     let area = f.area();
 
     // Vertical: status (1) | body (min) | input (3) | footer (1).
@@ -157,12 +157,13 @@ fn draw_main(f: &mut Frame, state: &mut AppState) {
         .split(area);
 
     draw_status(f, v[0], state);
-    draw_body(f, v[1], state);
+    let metrics = draw_body(f, v[1], state);
     draw_input(f, v[2], state);
     draw_footer(f, v[3], state);
+    metrics
 }
 
-fn draw_body(f: &mut Frame, area: Rect, state: &mut AppState) {
+fn draw_body(f: &mut Frame, area: Rect, state: &mut AppState) -> Option<ChatMetrics> {
     if area.width >= 100 {
         let h = Layout::default()
             .direction(Direction::Horizontal)
@@ -173,15 +174,17 @@ fn draw_body(f: &mut Frame, area: Rect, state: &mut AppState) {
             ])
             .split(area);
         draw_agents(f, h[0], state);
-        draw_chat(f, h[1], state);
+        let m = draw_chat(f, h[1], state);
         draw_sidebar(f, h[2], state);
+        m
     } else {
         let h = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(20), Constraint::Length(34)])
             .split(area);
-        draw_chat(f, h[0], state);
+        let m = draw_chat(f, h[0], state);
         draw_sidebar(f, h[1], state);
+        m
     }
 }
 
@@ -346,7 +349,7 @@ pub fn pick_chat_scroll(state: &AppState, metrics: ChatMetrics) -> u16 {
     }
 }
 
-fn draw_chat(f: &mut Frame, area: Rect, state: &mut AppState) {
+fn draw_chat(f: &mut Frame, area: Rect, state: &mut AppState) -> Option<ChatMetrics> {
     let focused = state.focus == Focus::Chat;
 
     // Title varies: when supervisor is running, prepend a status line.
@@ -368,13 +371,13 @@ fn draw_chat(f: &mut Frame, area: Rect, state: &mut AppState) {
 
     let lines = render_chat_lines(state);
     let metrics = compute_chat_metrics(&lines, inner);
-    // Publish viewport metrics back onto AppState so input handlers
-    // (PageUp/PageDown unit, scroll clamping) see the fresh values
-    // before the next key event is dispatched. Without this, the very
-    // first `j` after a window resize would scroll by the OLD visible
-    // height — a subtle off-by-screen bug.
-    state.chat_max_scroll = metrics.max_scroll as u16;
-    state.chat_visible_h = metrics.visible_h as u16;
+    // The metrics are returned to the caller (the event loop) which
+    // passes them to the input handler on the next key event. Before
+    // C6 the metrics were written back onto AppState here, leaking
+    // draw-path state into the input-handler interface. Now the
+    // single owner is the event loop, and the input handler sees them
+    // as a parameter — the same shape `pick_chat_scroll` already
+    // takes them in.
     let scroll = pick_chat_scroll(state, metrics);
 
     let p = Paragraph::new(lines)
@@ -400,6 +403,8 @@ fn draw_chat(f: &mut Frame, area: Rect, state: &mut AppState) {
         inner,
         &mut sb_state,
     );
+
+    Some(metrics)
 }
 
 

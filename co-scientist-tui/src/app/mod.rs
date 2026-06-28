@@ -169,18 +169,11 @@ pub struct AppState {
     // v4 — multi-panel state
     pub focus: Focus,
     pub chat_scroll: u16,
-    /// Maximum legal value of `chat_scroll`. Recomputed by `draw_chat`
-    /// every frame based on the rendered line count and the chat panel
-    /// height. Read by `handle_key_chat` so input clamping can happen
-    /// without re-rendering. Without this, `saturating_add(1)` on a u16
-    /// walks the value up to 65535 across many PageDowns and the user
-    /// gets stuck below the visible viewport until a draw happens.
-    pub chat_max_scroll: u16,
-    /// Visible height of the chat panel in rows, last computed by
-    /// `draw_chat`. Used by `handle_key_chat` to make PageUp/PageDown
-    /// scroll by one screen minus one row (industry convention) instead
-    /// of a fixed 10 lines.
-    pub chat_visible_h: u16,
+    /// `chat_max_scroll` and `chat_visible_h` used to live here but
+    /// were moved out in C6 (2026-06-28). They are now owned by the
+    /// event loop (`ui::draw` returns the latest `ChatMetrics` each
+    /// frame) and passed to the input handler as a parameter. The
+    /// draw path no longer writes input state.
     pub show_help: bool,
     pub sidebar_selected: usize,
 
@@ -234,8 +227,6 @@ impl AppState {
 
             focus: Focus::Input,
             chat_scroll: 0,
-            chat_max_scroll: 0,
-            chat_visible_h: 0,
             show_help: false,
             sidebar_selected: 0,
             streaming_assistant: None,
