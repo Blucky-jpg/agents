@@ -25,6 +25,7 @@
 //! - `Ctrl-C` / `Esc` → quit.
 //! - `?` → toggle the help overlay.
 
+mod agent_task;
 mod app;
 mod ipc;
 mod markdown;
@@ -146,7 +147,7 @@ async fn run_app(terminal: &mut Term, db_path: PathBuf) -> Result<()> {
     let agent_state = state.clone();
     let agent_tx_to_ui = tx_to_ui.clone();
     tokio::spawn(async move {
-        run_agent_task(db_path, run_id, agent_state, rx_to_agent, agent_tx_to_ui).await;
+        agent_task::run(db_path, run_id, agent_state, rx_to_agent, agent_tx_to_ui).await;
     });
 
     // The `model` displayed in the UI comes from `state.model`, which is
@@ -517,151 +518,6 @@ fn handle_key_sidebar(s: &mut AppState, key: KeyEvent) {
         }
         _ => {}
     }
-}
-
-async fn run_agent_task(
-    db_path: PathBuf,
-    initial_run_id: String,
-    state: SharedState,
-    mut rx: mpsc::UnboundedReceiver<UiToAgent>,
-    tx: mpsc::UnboundedSender<AgentToUi>,
-) {
-    let mut run_id = initial_run_id;
-    let mut runner: Option<co_scientist::Runner> = None;
-
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            UiToAgent::Shutdown => {
-                runner = None;
-                let new_id = {
-                    let s = state.lock().await;
-                    s.run_id.clone()
-                };
-                run_id = new_id;
-                if let Err(e) = rebuild_runner(&db_path, &run_id, &mut runner).await {
-                    let mut s = state.lock().await;
-                    s.push_log(ChatMsg::System(format!("rebuild failed: {e}")));
-                    s.busy = Busy::Idle;
-                }
-            }
-            UiToAgent::StartSupervisor { goal } => {
-                let sup_state = state.clone();
-                let sup_tx = tx.clone();
-                let sup_db = db_path.clone();
-                supervisor_session::start(sup_db, goal, sup_state, sup_tx);
-            }
-            UiToAgent::Turn {
-                agent_name,
-                user_text,
-            } => {
-                if runner.is_none()
-                    && let Err(e) = rebuild_runner(&db_path, &run_id, &mut runner).await
-                {
-                    let _ = tx.send(AgentToUi::TurnFailed {
-                        agent_name,
-                        error: format!("runner init failed: {e}"),
-                    });
-                    continue;
-                }
-                let runner = runner.as_mut().expect("just initialized");
-                let agent = match co_scientist::agents::AGENTS
-                    .iter()
-                    .find(|a| a.name == agent_name)
-                    .cloned()
-                {
-                    Some(a) => a,
-                    None => {
-                        let _ = tx.send(AgentToUi::TurnFailed {
-                            agent_name,
-                            error: "unknown agent".to_string(),
-                        });
-                        continue;
-                    }
-                };
-
-                let _ = tx.send(AgentToUi::TurnStarted {
-                    model: runner.model().to_string(),
-                });
-
-                // Streaming path: each text delta is forwarded to the UI as
-                // it arrives from the LLM subprocess. The runner pushes raw
-                // strings into a dedicated channel. The agent task itself
-                // drains the channel and forwards deltas through the UI
-                // channel — no separate task is needed and we get a clean
-                // happens-before for `TurnDone` (all deltas are flushed
-                // before we send it).
-                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
-                let forward_tx = tx.clone();
-                let forward_agent = agent.name.to_string();
-                let forward_deltas = async {
-                    while let Some(delta) = delta_rx.recv().await {
-                        // If the UI has dropped its receiver (Ctrl-C, etc.),
-                        // stop forwarding — there's no point piling up work.
-                        if forward_tx
-                            .send(AgentToUi::TurnDelta {
-                                agent_name: forward_agent.clone(),
-                                delta,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                };
-
-                // Run the streaming turn concurrently with the forwarder.
-                // The forwarder exits when `delta_tx` is dropped (i.e. when
-                // `turn_stream` returns), so this `join` guarantees all
-                // deltas have been forwarded before we move on.
-                let turn_fut = runner.turn_stream(&agent, &user_text, Some(delta_tx));
-                let (turn_result, _) = futures_join(turn_fut, forward_deltas).await;
-
-                match turn_result {
-                    Ok(outcome) => {
-                        let markers = outcome.markers.as_ref().clone();
-                        let _ = tx.send(AgentToUi::TurnDone {
-                            cleaned_text: outcome.cleaned_text,
-                            markers,
-                            agent_name: agent.name.to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AgentToUi::TurnFailed {
-                            agent_name: agent.name.to_string(),
-                            error: format!("{e:#}"),
-                        });
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// `tokio::join!` re-exported under a single function name so we don't pull
-/// the macro into scope at every call site.
-async fn futures_join<A, B>(a: A, b: B) -> (A::Output, B::Output)
-where
-    A: std::future::Future,
-    B: std::future::Future,
-{
-    tokio::join!(a, b)
-}
-
-
-async fn rebuild_runner(
-    db_path: &Path,
-    run_id: &str,
-    slot: &mut Option<co_scientist::Runner>,
-) -> Result<()> {
-    let conn = co_scientist::db::Db::connect_fresh(db_path.to_str().unwrap()).await?;
-    let d = co_scientist::Db::new(conn);
-    let mem = Memory::new(d);
-    *slot = Some(co_scientist::Runner::new(
-        mem,
-        run_id.to_string(),
-        RunnerConfig::default(),
-    ));
-    Ok(())
 }
 
 #[cfg(test)]
