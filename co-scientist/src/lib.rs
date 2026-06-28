@@ -45,6 +45,7 @@ pub mod runner;
 pub mod skill;
 pub mod skill_loader;
 pub mod supervisor;
+pub mod supervisor_bundle;
 pub mod tool;
 pub mod tools;
 pub mod tournament;

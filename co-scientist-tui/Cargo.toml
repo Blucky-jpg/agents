@@ -1,0 +1,27 @@
+[package]
+name = "co-scientist-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Ratatui front-end for the co-scientist memory layer."
+
+[[bin]]
+name = "co-scientist-tui"
+path = "src/main.rs"
+
+[dependencies]
+co-scientist = { path = "../co-scientist" }
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+anyhow = "1"
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Markdown rendering for LLM responses. We use pulldown-cmark directly
+# (not tui-markdown) because tui-markdown 0.3.x hardcodes a neon palette
+# (yellow headings, cyan code, magenta blockquotes) that violates the
+# calm-terminal one-accent rule. The hand-rolled renderer in
+# `render_markdown` reads the pulldown-cmark event stream and maps each
+# element to a `Span` styled from `crate::theme` — see DK16 in MEMORY.md.
+pulldown-cmark = { version = "0.12", default-features = false }
