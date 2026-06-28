@@ -22,6 +22,7 @@
 //! - `Tab` / `BackTab` → cycle focus between panels.
 //! - `Ctrl-N` → start a new single-agent run (clears the chat log).
 //! - `Ctrl-L` → clear chat log.
+//! - `Ctrl-P` → toggle the frame-profile badge in the status bar.
 //! - `Ctrl-C` / `Esc` → quit.
 //! - `?` → toggle the help overlay.
 
@@ -30,6 +31,7 @@ mod app;
 mod ipc;
 mod markdown;
 mod marker_scrubber;
+mod profile;
 mod splash;
 mod supervisor_session;
 mod theme;
@@ -38,7 +40,7 @@ mod ui;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
@@ -169,54 +171,117 @@ async fn run_app(terminal: &mut Term, db_path: PathBuf) -> Result<()> {
         max_scroll: 0,
     };
 
+    // Frame-profile instrumentation. Owns the rolling window; logs a
+    // summary to the TUI log file on shutdown and feeds the status-
+    // bar badge (Ctrl-P toggles). See `profile.rs` for the design.
+    let mut profile = profile::FrameProfile::new();
+    let mut latest_sample: Option<profile::FrameSample> = None;
+
     loop {
+        let frame_start = Instant::now();
+
+        // Phase (A): drain pending agent IPC. Non-blocking — if the
+        // channel is empty, `try_recv` is microseconds.
+        let drain_start = Instant::now();
+        let mut agent_msg_count = 0u32;
         while let Ok(msg) = rx_to_ui.try_recv() {
             handle_agent_msg(&state, msg).await;
+            agent_msg_count += 1;
         }
+        let drain_us = drain_start.elapsed().as_micros() as u64;
 
-        {
+        // Phase (B): draw. This is the most likely source of the
+        // user-reported lag spikes — `ui::draw` re-parses every
+        // assistant entry's markdown on every frame.
+        //
+        // We need three things from this block: (1) the draw's wall-
+        // clock duration for the profile, (2) the `Option<ChatMetrics>`
+        // that `ui::draw` returns, and (3) the terminal-draw's `Result`.
+        // The metrics Cell must live OUTSIDE the inner scope so we
+        // can read it after `terminal.draw` returns.
+        let metrics_cell = std::cell::Cell::new(None);
+        let draw_us;
+        let draw_result = {
+            let draw_start = Instant::now();
             let mut s = state.lock().await;
-            // `terminal.draw`'s closure must return `()`, so we route
-            // the metrics out through a `Cell`. Same thread, no
-            // contention — the cell is just a return-value channel.
-            let metrics_cell = std::cell::Cell::new(None);
-            terminal.draw(|f| {
-                metrics_cell.set(ui::draw(f, &mut s));
-            })?;
-            if let Some(m) = metrics_cell.into_inner() {
-                last_metrics = m;
-            }
+            let r = terminal.draw(|f| {
+                metrics_cell.set(ui::draw(f, &mut s, latest_sample));
+            });
+            draw_us = draw_start.elapsed().as_micros() as u64;
             drop(s);
+            r
+        };
+        draw_result?;
+        if let Some(m) = metrics_cell.into_inner() {
+            last_metrics = m;
         }
 
-        {
+        // Phase (C): tick + chat_scroll reset.
+        let tick_us = {
+            let tick_start = Instant::now();
             let mut s = state.lock().await;
             s.tick = s.tick.wrapping_add(1);
-            // While following the tail, keep `chat_scroll` pinned to the
-            // current bottom so the *next* time the user hits `j`/`k`/
-            // PageDown (which sets `follow_tail = false`), the anchor
-            // helper in `handle_key_chat` has a meaningful starting
-            // point. Previously this block set `chat_scroll = 0`, which
-            // (a) was redundant because the draw path picks `max_scroll`
-            // when `follow_tail` is on, and (b) meant leaving follow-tail
-            // mode started from row 0 — so the first `j` press scrolled
-            // one row down from the top instead of from where the user
-            // was visually anchored.
             if s.follow_tail {
                 s.chat_scroll = last_metrics.max_scroll as u16;
             }
-        }
+            tick_start.elapsed().as_micros() as u64
+        };
 
+        // Phase (D): input poll. A spike here means the terminal is
+        // slow to deliver events (crossterm / OS-level issue, not
+        // the TUI's render path). We measure the wall-clock cost of
+        // awaiting `event::poll` directly — the helper wraps a
+        // future, not a resolved Result.
+        let poll_start = Instant::now();
         let event_ready = event::poll(Duration::from_millis(50))?;
-        if event_ready
-            && let Event::Key(key) = event::read()?
-            && handle_key(&state, key, &tx_to_agent, &last_metrics).await?
-        {
+        let poll_us = poll_start.elapsed().as_micros() as u64;
+
+        // Phase (E): key dispatch. Only non-zero on frames where a
+        // key actually arrived.
+        let (key_result, key_us) = if event_ready {
+            let key_event = event::read()?;
+            if let Event::Key(key) = key_event {
+                let key_start = Instant::now();
+                let r = handle_key(&state, key, &tx_to_agent, &last_metrics).await;
+                let us = key_start.elapsed().as_micros() as u64;
+                (r, us)
+            } else {
+                (Ok(false), 0)
+            }
+        } else {
+            (Ok(false), 0)
+        };
+
+        let total_us = frame_start.elapsed().as_micros() as u64;
+        let sample = profile::FrameSample {
+            drain_us,
+            draw_us,
+            tick_us,
+            poll_us,
+            key_us,
+            total_us,
+            agent_msg_count,
+        };
+        profile.record(sample);
+        latest_sample = profile.latest();
+
+        if key_result? {
             let _ = tx_to_agent.send(UiToAgent::Shutdown);
             break;
         }
         tick.tick().await;
     }
+
+    // Dump the rolling summary to the TUI log file. The user reads
+    // this after quitting; the aggregate tells them which phase was
+    // the bottleneck without requiring the badge to be on.
+    let summary = profile.summary();
+    tracing::info!(
+        frames = profile.frame_count(),
+        max_agent_msgs_per_frame = profile.max_agent_msgs(),
+        "frame_profile: {}",
+        summary.format(profile.frame_count()),
+    );
 
     Ok(())
 }
@@ -273,6 +338,12 @@ async fn handle_key(
             s.log.clear();
             s.status = "log cleared".to_string();
             s.follow_tail = true;
+            return Ok(false);
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Toggle the frame-profile status-bar badge. Default off
+            // — this is a debug tool, not a feature.
+            s.show_profile = !s.show_profile;
             return Ok(false);
         }
         _ => {}

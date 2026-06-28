@@ -208,6 +208,10 @@ pub struct AppState {
 
     // splash
     pub show_splash: bool,
+
+    /// Toggle the frame-profile status-bar badge with `Ctrl-P`.
+    /// Off by default — this is a debug tool, not a feature.
+    pub show_profile: bool,
 }
 
 pub(crate) const LOG_CAP: usize = 1000;
@@ -243,6 +247,7 @@ impl AppState {
             tasks_failed: 0,
 
             show_splash: true,
+            show_profile: false,
         }
     }
 

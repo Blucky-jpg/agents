@@ -88,7 +88,11 @@ const ROUNDED: Borders = Borders::ALL;
 // are always rounded in v0.29's default border set when both left+right
 // and top+bottom are set. We use Borders::ALL and trust the default.
 
-pub fn draw(f: &mut Frame, state: &mut AppState) -> Option<ChatMetrics> {
+pub fn draw(
+    f: &mut Frame,
+    state: &mut AppState,
+    profile_sample: Option<crate::profile::FrameSample>,
+) -> Option<ChatMetrics> {
     let area = f.area();
 
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -97,7 +101,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) -> Option<ChatMetrics> {
     }
 
     if state.show_help {
-        let m = draw_main(f, state);
+        let m = draw_main(f, state, profile_sample);
         draw_help_overlay(f, area);
         return m;
     }
@@ -107,7 +111,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) -> Option<ChatMetrics> {
         return None;
     }
 
-    draw_main(f, state)
+    draw_main(f, state, profile_sample)
 }
 
 fn draw_too_small(f: &mut Frame, area: Rect, state: &mut AppState) {
@@ -142,7 +146,11 @@ fn draw_too_small(f: &mut Frame, area: Rect, state: &mut AppState) {
 
 // -- main layout -----------------------------------------------------------
 
-fn draw_main(f: &mut Frame, state: &mut AppState) -> Option<ChatMetrics> {
+fn draw_main(
+    f: &mut Frame,
+    state: &mut AppState,
+    profile_sample: Option<crate::profile::FrameSample>,
+) -> Option<ChatMetrics> {
     let area = f.area();
 
     // Vertical: status (1) | body (min) | input (3) | footer (1).
@@ -156,7 +164,7 @@ fn draw_main(f: &mut Frame, state: &mut AppState) -> Option<ChatMetrics> {
         ])
         .split(area);
 
-    draw_status(f, v[0], state);
+    draw_status(f, v[0], state, profile_sample);
     let metrics = draw_body(f, v[1], state);
     draw_input(f, v[2], state);
     draw_footer(f, v[3], state);
@@ -190,7 +198,12 @@ fn draw_body(f: &mut Frame, area: Rect, state: &mut AppState) -> Option<ChatMetr
 
 // -- status bar ------------------------------------------------------------
 
-fn draw_status(f: &mut Frame, area: Rect, state: &mut AppState) {
+fn draw_status(
+    f: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    profile_sample: Option<crate::profile::FrameSample>,
+) {
     let spinner = SPINNER[(state.tick as usize) % SPINNER_FRAMES];
     let busy_color = match state.busy {
         Busy::Idle => theme::TEAL,
@@ -220,6 +233,23 @@ fn draw_status(f: &mut Frame, area: Rect, state: &mut AppState) {
     ));
     left_spans.push(Span::styled("  ·  ", theme::dim()));
     left_spans.push(Span::styled(busy_text, Style::default().fg(busy_color)));
+    // Frame-profile badge (Ctrl-P toggles). Renders only when both
+    // the toggle is on AND the event loop has recorded at least one
+    // sample. Uses WARNING color when draw time exceeds 16ms
+    // (one 60fps frame) — visual cue that the user is feeling lag.
+    // No new accent color introduced; warning is already in the
+    // palette for "this needs attention" semantics.
+    if state.show_profile
+        && let Some(s) = profile_sample
+    {
+        left_spans.push(Span::styled("  ·  ", theme::dim()));
+        let badge_style = if s.draw_us > 16_000 {
+            Style::default().fg(theme::WARNING)
+        } else {
+            theme::dim()
+        };
+        left_spans.push(Span::styled(crate::profile::badge_text(s), badge_style));
+    }
     let left = Line::from(left_spans);
 
     // Bottom border separates status from body. Thin line across the row below.
