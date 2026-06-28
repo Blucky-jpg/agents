@@ -259,7 +259,7 @@ pub fn render(input: &str) -> Vec<Vec<Span<'static>>> {
                 flush!();
             }
             Event::Start(Tag::Strong) => {
-                inline_stack.push(Style::default().fg(theme::EMPHASIS).add_modifier(Modifier::BOLD));
+                inline_stack.push(Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD));
             }
             Event::End(TagEnd::Strong) => {
                 inline_stack.pop();
@@ -472,13 +472,13 @@ fn heading_style(level: pulldown_cmark::HeadingLevel) -> Style {
     use pulldown_cmark::HeadingLevel;
     match level {
         HeadingLevel::H1 => Style::default()
-            .fg(theme::TEAL)
+            .fg(theme::BLUE)
             .add_modifier(Modifier::BOLD),
         HeadingLevel::H2 | HeadingLevel::H3 => Style::default()
-            .fg(theme::EMPHASIS)
+            .fg(theme::BLUE)
             .add_modifier(Modifier::BOLD),
         HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => Style::default()
-            .fg(theme::FG)
+            .fg(theme::BLUE)
             .add_modifier(Modifier::BOLD),
     }
 }

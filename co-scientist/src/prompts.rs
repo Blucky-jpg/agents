@@ -41,6 +41,7 @@ pub enum AgentMode {
     ReflectionReview,
     ReflectionObservation,
     ReflectionVerification,
+    ReflectionOnResult,
     RankingPairwise,
     RankingDebate,
     EvolutionCombine,
@@ -49,6 +50,9 @@ pub enum AgentMode {
     EvolutionOutOfBox,
     MetaReviewSystem,
     MetaReviewFinal,
+    ExperimentDesign,
+    ExperimentExecute,
+    ExperimentEvaluate,
 }
 
 impl AgentMode {
@@ -61,6 +65,7 @@ impl AgentMode {
             Self::ReflectionReview => "reflection_review",
             Self::ReflectionObservation => "reflection_observation",
             Self::ReflectionVerification => "reflection_verification",
+            Self::ReflectionOnResult => "reflection_on_result",
             Self::RankingPairwise => "ranking_pairwise",
             Self::RankingDebate => "ranking_debate",
             Self::EvolutionCombine => "evolution_combine",
@@ -69,6 +74,36 @@ impl AgentMode {
             Self::EvolutionOutOfBox => "evolution_out_of_box",
             Self::MetaReviewSystem => "metareview_system",
             Self::MetaReviewFinal => "metareview_final",
+            Self::ExperimentDesign => "experiment_design",
+            Self::ExperimentExecute => "experiment_execute",
+            Self::ExperimentEvaluate => "experiment_evaluate",
+        }
+    }
+
+    /// Resolve a filename (e.g. `"parse_goal"`) back into the enum
+    /// variant. Inverse of [`Self::filename`]. Returns `None` for
+    /// unknown names so callers can produce a clear error.
+    pub fn from_filename(s: &str) -> Option<Self> {
+        match s {
+            "parse_goal" => Some(Self::ParseGoal),
+            "generation_literature" => Some(Self::GenerationLiterature),
+            "generation_debate" => Some(Self::GenerationDebate),
+            "reflection_review" => Some(Self::ReflectionReview),
+            "reflection_observation" => Some(Self::ReflectionObservation),
+            "reflection_verification" => Some(Self::ReflectionVerification),
+            "reflection_on_result" => Some(Self::ReflectionOnResult),
+            "ranking_pairwise" => Some(Self::RankingPairwise),
+            "ranking_debate" => Some(Self::RankingDebate),
+            "evolution_combine" => Some(Self::EvolutionCombine),
+            "evolution_simplify" => Some(Self::EvolutionSimplify),
+            "evolution_feasibility" => Some(Self::EvolutionFeasibility),
+            "evolution_out_of_box" => Some(Self::EvolutionOutOfBox),
+            "metareview_system" => Some(Self::MetaReviewSystem),
+            "metareview_final" => Some(Self::MetaReviewFinal),
+            "experiment_design" => Some(Self::ExperimentDesign),
+            "experiment_execute" => Some(Self::ExperimentExecute),
+            "experiment_evaluate" => Some(Self::ExperimentEvaluate),
+            _ => None,
         }
     }
 
@@ -79,13 +114,17 @@ impl AgentMode {
             Self::GenerationLiterature | Self::GenerationDebate => "generation",
             Self::ReflectionReview
             | Self::ReflectionObservation
-            | Self::ReflectionVerification => "reflection",
+            | Self::ReflectionVerification
+            | Self::ReflectionOnResult => "reflection",
             Self::RankingPairwise | Self::RankingDebate => "ranking",
             Self::EvolutionCombine
             | Self::EvolutionSimplify
             | Self::EvolutionFeasibility
             | Self::EvolutionOutOfBox => "evolution",
             Self::MetaReviewSystem | Self::MetaReviewFinal => "metareview",
+            Self::ExperimentDesign
+            | Self::ExperimentExecute
+            | Self::ExperimentEvaluate => "experiment",
         }
     }
 
@@ -98,6 +137,7 @@ impl AgentMode {
                 Self::ReflectionReview,
                 Self::ReflectionObservation,
                 Self::ReflectionVerification,
+                Self::ReflectionOnResult,
             ],
             "ranking" => &[Self::RankingPairwise, Self::RankingDebate],
             "evolution" => &[
@@ -107,6 +147,11 @@ impl AgentMode {
                 Self::EvolutionOutOfBox,
             ],
             "metareview" => &[Self::MetaReviewSystem, Self::MetaReviewFinal],
+            "experiment" => &[
+                Self::ExperimentDesign,
+                Self::ExperimentExecute,
+                Self::ExperimentEvaluate,
+            ],
             _ => &[],
         }
     }
@@ -147,6 +192,10 @@ impl Prompts {
                 "evolution_out_of_box" => include_str!("../prompts/evolution_out_of_box.md"),
                 "metareview_system" => include_str!("../prompts/metareview_system.md"),
                 "metareview_final" => include_str!("../prompts/metareview_final.md"),
+                "experiment_design" => include_str!("../prompts/experiment_design.md"),
+                "experiment_execute" => include_str!("../prompts/experiment_execute.md"),
+                "experiment_evaluate" => include_str!("../prompts/experiment_evaluate.md"),
+                "reflection_on_result" => include_str!("../prompts/reflection_on_result.md"),
                 other => anyhow::bail!("unknown prompt file: {other}.md"),
             };
             env.add_template_owned(name.to_string(), body.to_string())
@@ -194,6 +243,7 @@ pub const PROMPT_MODES: &[AgentMode] = &[
     AgentMode::ReflectionReview,
     AgentMode::ReflectionObservation,
     AgentMode::ReflectionVerification,
+    AgentMode::ReflectionOnResult,
     AgentMode::RankingPairwise,
     AgentMode::RankingDebate,
     AgentMode::EvolutionCombine,
@@ -202,6 +252,9 @@ pub const PROMPT_MODES: &[AgentMode] = &[
     AgentMode::EvolutionOutOfBox,
     AgentMode::MetaReviewSystem,
     AgentMode::MetaReviewFinal,
+    AgentMode::ExperimentDesign,
+    AgentMode::ExperimentExecute,
+    AgentMode::ExperimentEvaluate,
 ];
 
 /// A thin wrapper around `serde_json::Value` (an object) for prompt
@@ -269,7 +322,7 @@ mod tests {
         // be syntactically valid but still fail to render without the
         // right variables (strict mode is the default in Prompts::new).
         let p = Prompts::new().expect("prompts load");
-        assert_eq!(PROMPT_MODES.len(), 14);
+        assert_eq!(PROMPT_MODES.len(), 18);
         for mode in PROMPT_MODES {
             // Touch the template; this parses + caches it. Rendering is
             // covered by the per-template tests below.

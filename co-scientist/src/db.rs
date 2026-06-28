@@ -318,6 +318,30 @@ fn migrate(conn: &Connection) -> Result<()> {
             created_at      TEXT    NOT NULL
         )"#,
         "CREATE INDEX IF NOT EXISTS idx_matches_session ON tournament_matches(session_id)",
+        r#"
+        CREATE TABLE IF NOT EXISTS experiments (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT    NOT NULL,
+            hypothesis_id   INTEGER NOT NULL,
+            status          TEXT    NOT NULL DEFAULT 'designed',
+            code            TEXT    NOT NULL,
+            metric_name     TEXT    NOT NULL DEFAULT '',
+            metric_value    REAL,
+            metric_json     TEXT,
+            stdout          TEXT,
+            stderr          TEXT,
+            exit_code       INTEGER,
+            duration_ms     INTEGER,
+            error           TEXT,
+            created_at      TEXT    NOT NULL,
+            started_at      TEXT,
+            finished_at     TEXT,
+            idempotency_key TEXT,
+            FOREIGN KEY (hypothesis_id) REFERENCES hypotheses(id)
+        )"#,
+        "CREATE INDEX IF NOT EXISTS idx_experiments_session ON experiments(session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_experiments_hypothesis ON experiments(hypothesis_id)",
+        "CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(session_id, status)",
     ];
 
     for sql in stmts {
@@ -336,12 +360,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     try_add_column(conn, "semantic_memories", "last_accessed_at", "TEXT")?;
     try_add_column(conn, "behavior_memories", "last_accessed_at", "TEXT")?;
     try_add_column(conn, "behavior_memories", "archived", "INTEGER NOT NULL DEFAULT 0")?;
+    try_add_column(conn, "hypotheses", "latest_experiment_id", "INTEGER")?;
+    try_add_column(conn, "experiments", "idempotency_key", "TEXT")?;
 
     for sql in [
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idem ON events(idempotency_key)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_semantic_idem ON semantic_memories(idempotency_key)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_behavior_idem ON behavior_memories(idempotency_key)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem ON tasks(idempotency_key)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_experiments_idem ON experiments(idempotency_key)",
     ] {
         conn.execute(sql, [])
             .with_context(|| format!("creating index: {sql}"))?;

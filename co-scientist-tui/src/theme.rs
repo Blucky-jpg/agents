@@ -43,6 +43,11 @@ pub const ACCENT2: Color = Color::Rgb(0xd9, 0xa3, 0x73);
 /// headers, link underlines). Separates "scaffolding" from "metadata"
 /// since both were previously `MUTED` and indistinguishable.
 pub const SECTION: Color = Color::Rgb(0x7a, 0x8f, 0x9f);
+/// Cool blue — used for markdown content accents: H1 headings, H2/H3
+/// headings, and bold inline text. Distinct from TEAL (chrome accent)
+/// and from the body grey family. Calibrated to read as a heading
+/// without competing with the teal focus border.
+pub const BLUE: Color = Color::Rgb(0x7a, 0xb8, 0xff);
 
 pub fn bold(c: Color) -> Style {
     Style::default().fg(c).add_modifier(Modifier::BOLD)

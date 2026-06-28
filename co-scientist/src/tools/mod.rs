@@ -26,10 +26,12 @@ use serde_json::Value;
 use crate::memory::Memory;
 
 mod curation;
+mod experiment;
 mod memory;
 mod research;
 
 pub use curation::*;
+pub use experiment::*;
 pub use memory::*;
 pub use research::*;
 
@@ -83,6 +85,10 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(RecordHypothesisTool),
         Arc::new(RecordReviewTool),
         Arc::new(RecordTournamentMatchTool),
+        // Empirical-loop tools (see src/experiment.rs).
+        Arc::new(DesignExperimentTool),
+        Arc::new(ExecuteExperimentTool),
+        Arc::new(EvaluateResultTool),
     ]
 }
 

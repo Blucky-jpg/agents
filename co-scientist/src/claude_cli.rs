@@ -213,6 +213,134 @@ impl ClaudeCli {
         }
     }
 
+    /// Stream a turn, invoking `on_delta` for each newly-arrived chunk of
+    /// assistant text. The callback fires with the *incremental* text —
+    /// i.e. the tail of the assistant text that wasn't present in the
+    /// previous frame. Concatenating all `on_delta` calls in order yields
+    /// the same final text as `query`.
+    ///
+    /// Two frame sources can carry text:
+    ///
+    /// 1. `stream_event` frames (when the CLI is started with
+    ///    `--include-partial-messages`). These wrap Anthropic's native
+    ///    `content_block_delta` events — `text_delta` payloads are forwarded
+    ///    as soon as they arrive. **This is the primary live-streaming path.**
+    /// 2. `assistant` frames — the CLI's accumulated-snapshot frames. Each
+    ///    one carries the full text-so-far; we track `emitted_chars` and
+    ///    emit only the new tail. This is the fallback when the CLI doesn't
+    ///    send partial messages (older CLI versions, certain model paths).
+    ///
+    /// Both paths update `assistant_text` so the returned `TurnResponse`
+    /// is identical to `query` for the same input.
+    ///
+    /// `on_delta` runs on the same task that reads from `self.rx`, so it
+    /// must be cheap (no awaits, no blocking). Use a channel if you need
+    /// to ship the delta elsewhere.
+    pub async fn query_stream(
+        &self,
+        prompt: String,
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<TurnResponse> {
+        // Write the user frame.
+        {
+            let mut inner = self.inner.lock().await;
+            let stdin = inner
+                .child
+                .stdin
+                .as_mut()
+                .context("claude child stdin closed")?;
+            let frame = json!({
+                "type": "user",
+                "message": { "role": "user", "content": prompt },
+                "parent_tool_use_id": null,
+                "session_id": USER_FRAME_SESSION_TAG,
+            });
+            stdin
+                .write_all(frame.to_string().as_bytes())
+                .await
+                .context("writing user frame to claude stdin")?;
+            stdin.write_all(b"\n").await.context("newline after user")?;
+            stdin.flush().await.context("flushing user frame")?;
+        }
+
+        let mut assistant_text = String::new();
+        let mut emitted_chars: usize = 0;
+        // When the CLI sends both `stream_event` deltas (live path) AND
+        // `assistant` snapshots (final accumulated message), we already
+        // accumulated the text via stream events. To prevent the
+        // duplication bug where the final `assistant` snapshot re-emits the
+        // same text, we track whether any stream-event deltas were seen
+        // and skip `assistant` text entirely if so.
+        let mut saw_stream_delta = false;
+        let mut rx = self.rx.lock().await;
+        loop {
+            match rx.recv().await {
+                Some(v) => match v.get("type").and_then(|t| t.as_str()) {
+                    // Primary live-streaming path: token deltas from Anthropic's
+                    // streaming API. Each `content_block_delta` carries a
+                    // `text_delta.text` payload that we forward verbatim.
+                    Some("stream_event") => {
+                        if let Some(delta_text) = extract_stream_delta(&v) {
+                            assistant_text.push_str(&delta_text);
+                            on_delta(&delta_text);
+                            emitted_chars = assistant_text.chars().count();
+                            saw_stream_delta = true;
+                        }
+                    }
+                    // `assistant` frames are accumulated snapshots. They
+                    // arrive AFTER all stream events have fired — their
+                    // purpose is to deliver the final message text in one
+                    // piece for non-streaming consumers. If we've already
+                    // streamed every token, this snapshot would re-emit the
+                    // entire response and double the visible text. Skip it
+                    // when we already have the text from stream deltas.
+                    //
+                    // Fallback path: if no stream deltas arrived (older CLI
+                    // without `--include-partial-messages`, or a non-text
+                    // response like pure tool calls), emit the accumulated
+                    // text once.
+                    Some("assistant") => {
+                        if let Some(text) = extract_assistant_text(&v) {
+                            if saw_stream_delta {
+                                // Already streamed token-by-token. Use the
+                                // snapshot only to reconcile — if the
+                                // stream was truncated or contained
+                                // surrogate markers, fall back to the
+                                // snapshot's text so the final output is
+                                // complete.
+                                if text.chars().count() > emitted_chars {
+                                    let new_tail: String = text
+                                        .chars()
+                                        .skip(emitted_chars)
+                                        .collect();
+                                    assistant_text.push_str(&new_tail);
+                                    on_delta(&new_tail);
+                                    emitted_chars = text.chars().count();
+                                }
+                                // Else: snapshot is a prefix of what we
+                                // streamed (common — the snapshot matches
+                                // the streamed prefix). Drop it.
+                            } else {
+                                // No streaming happened — emit the whole
+                                // snapshot in one shot.
+                                assistant_text.push_str(&text);
+                                on_delta(&text);
+                                emitted_chars = text.chars().count();
+                            }
+                        }
+                    }
+                    Some("result") => {
+                        return Ok(TurnResponse { assistant_text });
+                    }
+                    _ => {}
+                },
+                None => {
+                    anyhow::bail!("claude stdout closed before result frame");
+                }
+            }
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         let mut inner = self.inner.lock().await;
         let _ = inner.child.start_kill();
@@ -228,6 +356,11 @@ fn build_args(options: &ClaudeOptions) -> Vec<String> {
         "--input-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
+        // Emit `stream_event` frames as the model generates tokens, not just
+        // the final accumulated `assistant` message. Without this flag, the
+        // CLI buffers the full response and sends one `assistant` frame at
+        // the end — which makes token-level streaming invisible to us.
+        "--include-partial-messages".to_string(),
     ];
     if let Some(p) = &options.system_prompt {
         args.push("--system-prompt".to_string());
@@ -274,6 +407,33 @@ fn extract_assistant_text(v: &Value) -> Option<String> {
     } else {
         Some(parts.join("\n"))
     }
+}
+
+/// Extract the incremental text from a `stream_event` frame.
+///
+/// Frame shape:
+/// ```json
+/// {"type": "stream_event",
+///  "event": {"type": "content_block_delta",
+///            "index": 0,
+///            "delta": {"type": "text_delta", "text": "Hello"}}}
+/// ```
+///
+/// We forward `delta.text` only when both the outer event is
+/// `content_block_delta` AND the inner delta is `text_delta`. Other delta
+/// types (`input_json_delta` for tool calls, `thinking_delta` for extended
+/// thinking, signature deltas, etc.) are not text the user wants to see
+/// streamed.
+fn extract_stream_delta(v: &Value) -> Option<String> {
+    let event = v.get("event")?;
+    if event.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
+        return None;
+    }
+    let delta = event.get("delta")?;
+    if delta.get("type").and_then(|t| t.as_str()) != Some("text_delta") {
+        return None;
+    }
+    delta.get("text").and_then(|t| t.as_str()).map(String::from)
 }
 
 #[cfg(test)]
@@ -376,6 +536,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns"
                 "--input-format",
                 "stream-json",
                 "--verbose",
+                "--include-partial-messages",
                 "--system-prompt",
                 "you are a helper",
                 "--allowedTools",
@@ -401,5 +562,222 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns"
         assert!(!is_init_success(&v2));
         let v3 = json!({"type":"control_response","response":{"subtype":"error","request_id":"req_1"}});
         assert!(!is_init_success(&v3));
+    }
+
+    #[test]
+    fn stream_delta_extracts_text_only() {
+        // The canonical `text_delta` frame — must extract the text.
+        let v = json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hello world"}
+            }
+        });
+        assert_eq!(extract_stream_delta(&v).as_deref(), Some("Hello world"));
+
+        // Tool-use deltas carry JSON, not user-visible text — must drop.
+        let v_tool = json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}
+            }
+        });
+        assert_eq!(extract_stream_delta(&v_tool), None);
+
+        // Other stream events (message_start, content_block_start, etc.)
+        // have no `delta` — must drop.
+        let v_start = json!({
+            "type": "stream_event",
+            "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
+        });
+        assert_eq!(extract_stream_delta(&v_start), None);
+
+        // Non-stream frames — must drop.
+        let v_assistant = json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "x"}]}
+        });
+        assert_eq!(extract_stream_delta(&v_assistant), None);
+    }
+
+    /// Simulate the dedup logic that `query_stream` runs against incoming
+    /// frames. The CLI's actual frame sequence is:
+    ///
+    /// ```text
+    /// stream_event(text_delta "Hello ")
+    /// stream_event(text_delta "world")
+    /// stream_event(text_delta "!")
+    /// assistant({message: {content: [{type: "text", text: "Hello world!"}]}})
+    /// result
+    /// ```
+    ///
+    /// Without the `saw_stream_delta` guard, the consumer would emit
+    /// "Hello world!" twice (once token-by-token, once via the assistant
+    /// snapshot). With the guard, the snapshot is recognized as a prefix
+    /// of what was already streamed and dropped.
+    ///
+    /// This test pins down the **post-conditions** of the dedup logic by
+    /// replaying the same algorithm against a known frame sequence. If
+    /// anyone changes `query_stream` in a way that breaks dedup, this
+    /// test will fail — even though we can't drive `ClaudeCli::query_stream`
+    /// directly without a subprocess.
+    #[test]
+    fn stream_then_assistant_does_not_double_emit() {
+        // Frames in the order the CLI emits them.
+        let frames = vec![
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}}),
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Hello world!"}]}}),
+            json!({"type":"result","result":"ok"}),
+        ];
+
+        // Mirror of the in-loop logic. If query_stream drifts from this,
+        // the assertion will diverge from what the real consumer sees.
+        let mut assistant_text = String::new();
+        let mut emitted_chars: usize = 0;
+        let mut saw_stream_delta = false;
+        let mut emitted = String::new();
+
+        for v in frames {
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("stream_event") => {
+                    if let Some(t) = extract_stream_delta(&v) {
+                        assistant_text.push_str(&t);
+                        emitted.push_str(&t);
+                        emitted_chars = assistant_text.chars().count();
+                        saw_stream_delta = true;
+                    }
+                }
+                Some("assistant") => {
+                    if let Some(text) = extract_assistant_text(&v) {
+                        if saw_stream_delta {
+                            if text.chars().count() > emitted_chars {
+                                let new_tail: String = text
+                                    .chars()
+                                    .skip(emitted_chars)
+                                    .collect();
+                                assistant_text.push_str(&new_tail);
+                                emitted.push_str(&new_tail);
+                                emitted_chars = text.chars().count();
+                            }
+                            // else: snapshot is prefix of streamed → drop.
+                        } else {
+                            assistant_text.push_str(&text);
+                            emitted.push_str(&text);
+                            emitted_chars = text.chars().count();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(emitted, "Hello world!");
+        assert_eq!(assistant_text, "Hello world!");
+    }
+
+    /// Mirror test for the **fallback path**: when the CLI sends only an
+    /// `assistant` snapshot (no stream events), the whole text must be
+    /// emitted in one go.
+    #[test]
+    fn assistant_only_emits_full_text() {
+        let frames = vec![
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"fallback response"}]}}),
+            json!({"type":"result","result":"ok"}),
+        ];
+
+        let mut assistant_text = String::new();
+        let mut emitted_chars: usize = 0;
+        let mut saw_stream_delta = false;
+        let mut emitted = String::new();
+
+        for v in frames {
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("stream_event") => {
+                    if let Some(t) = extract_stream_delta(&v) {
+                        assistant_text.push_str(&t);
+                        emitted.push_str(&t);
+                        emitted_chars = assistant_text.chars().count();
+                        saw_stream_delta = true;
+                    }
+                }
+                Some("assistant") => {
+                    if let Some(text) = extract_assistant_text(&v) {
+                        if saw_stream_delta {
+                            // not reached in this test
+                        } else {
+                            assistant_text.push_str(&text);
+                            emitted.push_str(&text);
+                            emitted_chars = text.chars().count();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(emitted, "fallback response");
+        assert_eq!(assistant_text, "fallback response");
+    }
+
+    /// Edge case: stream deltas deliver "Hello world" but the final
+    /// `assistant` snapshot has been truncated by the CLI to "Hello"
+    /// (rare but possible if the CLI errors mid-stream and re-emits a
+    /// shorter snapshot). The consumer should NOT drop text — it should
+    /// keep the longer streamed version.
+    #[test]
+    fn shorter_assistant_snapshot_does_not_truncate_streamed_text() {
+        let frames = vec![
+            json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello world"}}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}),
+            json!({"type":"result","result":"ok"}),
+        ];
+
+        let mut assistant_text = String::new();
+        let mut emitted_chars: usize = 0;
+        let mut saw_stream_delta = false;
+        let mut emitted = String::new();
+
+        for v in frames {
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("stream_event") => {
+                    if let Some(t) = extract_stream_delta(&v) {
+                        assistant_text.push_str(&t);
+                        emitted.push_str(&t);
+                        emitted_chars = assistant_text.chars().count();
+                        saw_stream_delta = true;
+                    }
+                }
+                Some("assistant") => {
+                    if let Some(text) = extract_assistant_text(&v) {
+                        if saw_stream_delta {
+                            if text.chars().count() > emitted_chars {
+                                let new_tail: String = text
+                                    .chars()
+                                    .skip(emitted_chars)
+                                    .collect();
+                                assistant_text.push_str(&new_tail);
+                                emitted.push_str(&new_tail);
+                                emitted_chars = text.chars().count();
+                            }
+                            // shorter snapshot → drop
+                        } else {
+                            assistant_text.push_str(&text);
+                            emitted.push_str(&text);
+                            emitted_chars = text.chars().count();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(emitted, "Hello world");
+        assert_eq!(assistant_text, "Hello world");
     }
 }

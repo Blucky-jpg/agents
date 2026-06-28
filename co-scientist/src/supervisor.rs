@@ -364,7 +364,70 @@ impl Supervisor {
             info!("injected metareview/GenerateSystemFeedback");
         }
 
+        // Experimental-loop injection. For each reviewed hypothesis
+        // that has no experiment yet, enqueue an experiment_design
+        // task. The 3-stage chain (design→execute→evaluate→reflect)
+        // is wired in `run_agent::enqueue_follow_ups`. Capped to one
+        // new design per idle tick so a flood of newly-reviewed
+        // hypotheses doesn't starve other work.
+        if let Ok(Some((hyp_id, _))) = self.pick_hypothesis_needing_experiment().await {
+            self.queue
+                .enqueue(EnqueueRequest {
+                    session_id: self.session_id.clone(),
+                    agent: "experiment".into(),
+                    action: "run_agent".into(),
+                    payload: json!({
+                        "agent": "experiment",
+                        "mode": "experiment_design",
+                        "prompt": "",
+                        "hypothesis_id": hyp_id,
+                        "goal": self.goal,
+                        "preferences": self.preferences,
+                    }),
+                    priority: 90, // below reflection/ranking so we don't crowd them out
+                    max_attempts: 3,
+                })
+                .await?;
+            injected += 1;
+            info!(hyp_id, "injected experiment/DesignForHypothesis");
+        }
+
         Ok(injected)
+    }
+
+    /// Pick a hypothesis that has been reviewed at least once but
+    /// has no experiment yet. Returns (hypothesis_id, latest_review_id)
+    /// so the caller can log if needed. Greedy: picks the
+    /// lowest-Elo reviewed hypothesis to push weak claims through
+    /// the empirical loop first.
+    async fn pick_hypothesis_needing_experiment(&self) -> Result<Option<(i64, Option<i64>)>> {
+        let conn = self.memory.db().conn();
+        // A hypothesis is "experimentable" if it has at least one
+        // review AND no experiment row yet. The `latest_experiment_id`
+        // column lets us skip hypotheses that already have one.
+        let mut rows = conn
+            .query(
+                "SELECT h.id, h.elo
+                 FROM hypotheses h
+                 WHERE h.session_id = ?1
+                   AND h.state IN ('reviewed', 'in_tournament', 'ranked')
+                   AND h.latest_experiment_id IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM semantic_memories s
+                       WHERE s.run_id = h.session_id
+                         AND s.scope = 'review'
+                         AND s.details_json LIKE '%' || CAST(h.id AS TEXT) || '%'
+                   )
+                 ORDER BY h.elo ASC
+                 LIMIT 1",
+                [self.session_id.as_str()],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(Some((row.get(0)?, None)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Check termination conditions. Returns `Some(reason)` if done.

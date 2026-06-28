@@ -18,6 +18,9 @@ rusqlite = { workspace = true }
 # the vendored ante-agent-sdk to drop its transitive dep graph
 # (notably turso_core via the agent-sdk).
 which = "7"
+# Auto-cleaning tempdirs for sandboxed experiment execution (see
+# src/experiment.rs). On `Drop` the directory and contents are removed.
+tempfile = "3"
 
 anyhow = "1"
 async-trait = "0.1"
@@ -36,7 +39,6 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 futures = "0.3"
-tempfile = "3"
 
 [[test]]
 name = "integration"

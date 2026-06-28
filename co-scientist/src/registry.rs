@@ -176,11 +176,32 @@ pub fn default_allowlist(agent: &str) -> Option<Vec<&'static str>> {
     ];
     let archive_tools = vec!["archive_observation", "delete_observation"];
     let ranking_only = vec!["record_tournament_match"];
+    let experiment_tools = vec![
+        // Empirical loop. `save_semantic` + `record_review` let the
+        // experiment agent record its designs/results and contribute
+        // back to the tournament.
+        "save_semantic",
+        "save_behavior",
+        "get_context",
+        "peek_context",
+        "get_timeline",
+        "get_observation",
+        "design_experiment",
+        "execute_experiment",
+        "evaluate_result",
+        "record_review",
+    ];
     match agent {
-        // Supervisor can curate its own session: archive or delete
-        // observations that turned out to be junk. Otherwise no memory
-        // tools — it just parses the goal.
-        "supervisor" => Some(archive_tools.clone()),
+        // Supervisor parses the goal into a research plan (calls
+        // `record_research_plan`, which canonicalizes to
+        // `save_semantic` with scope="plan") and curates its own
+        // session (archive / delete junk observations). The prompt
+        // ↔ allowlist validator enforces that both sides agree.
+        "supervisor" => {
+            let mut v = vec!["save_semantic", "record_research_plan"];
+            v.extend(archive_tools.iter().copied());
+            Some(v)
+        }
         // Ranking only needs the tournament match tool.
         "ranking" => Some(ranking_only),
         // Research agents get the full set; metareview can also curate.
@@ -190,8 +211,10 @@ pub fn default_allowlist(agent: &str) -> Option<Vec<&'static str>> {
             v.extend(archive_tools.iter().copied());
             Some(v)
         }
+        // Experiment agent — the empirical loop.
+        "experiment" => Some(experiment_tools),
         // Legacy / pre-refactor names.
-        "literature" | "hypothesis" | "experiment" | "analysis" | "critic"
+        "literature" | "hypothesis" | "analysis" | "critic"
         | "synthesizer" => Some(research),
         _ => Some(research),
     }

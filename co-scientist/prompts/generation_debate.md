@@ -14,25 +14,24 @@ Review Overview:
 Procedure:
 
 Initial contribution (if initiating the discussion):
-Propose three distinct {{ idea_attributes | default('novel') }} hypotheses.
+Propose three distinct {{ idea_attributes | default('novel') }} hypotheses. Each should pull a concept from a different domain and treat the cross-domain analogy as the proposed mechanism.
 
 Subsequent contributions (continuing the discussion):
-- Pose clarifying questions if ambiguities or uncertainties arise.
 - Critically evaluate the hypotheses proposed thus far, addressing the following aspects:
    - Adherence to {{ idea_attributes | default('novel') }} criteria.
+   - Strength of the cross-domain transfer: is the analogy load-bearing, or decoration?
    - Utility and practicality.
    - Level of detail and specificity.
 - Identify any weaknesses or potential limitations.
-- Propose concrete improvements and refinements to address identified weaknesses.
-- Conclude your response with a refined iteration of the hypothesis.
+- Refine ONE promising hypothesis across successive turns rather than proliferating.
+- When iteration has plateaued, conclude.
 
 General guidelines:
-- Exhibit boldness and creativity in your contributions.
-- Maintain a helpful and collaborative approach.
-- Prioritize the generation of a high-quality {{ idea_attributes | default('novel') }} hypothesis.
+- Iterate one idea deeply rather than scattering across many.
+- Generate early — ship rough drafts; reflection and ranking filter later.
 
 Termination condition:
-When sufficient discussion has transpired (typically 3-5 conversational turns, with a maximum of 10 turns) and all relevant questions and points have been thoroughly addressed and clarified, conclude the process by writing "HYPOTHESIS" (in all capital letters) followed by a concise and self-contained exposition of the finalized idea. Then immediately call the `record_hypothesis` tool to register the finalized hypothesis.
+As soon as one hypothesis is novel, concrete, and has been refined past its first objection (typically 2-3 conversational turns), conclude by writing "HYPOTHESIS" (in all capital letters) followed by a concise and self-contained exposition of the finalized idea. Then immediately call the `record_hypothesis` tool to register the finalized hypothesis. Do not extend the discussion once a viable candidate exists.
 
 #BEGIN TRANSCRIPT#
 {{ transcript | default('(no prior turns)') }}

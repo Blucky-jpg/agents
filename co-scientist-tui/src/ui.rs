@@ -399,7 +399,7 @@ fn draw_chat(f: &mut Frame, area: Rect, state: &mut AppState) -> Option<ChatMetr
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let lines = render_chat_lines(state);
+    let lines = render_chat_lines(state, inner.width as usize);
     let metrics = compute_chat_metrics(&lines, inner);
     // The metrics are returned to the caller (the event loop) which
     // passes them to the input handler on the next key event. Before
@@ -438,7 +438,7 @@ fn draw_chat(f: &mut Frame, area: Rect, state: &mut AppState) -> Option<ChatMetr
 }
 
 
-fn render_chat_lines(state: &AppState) -> Vec<Line<'static>> {
+fn render_chat_lines(state: &AppState, max_width: usize) -> Vec<Line<'static>> {
     // Three states for an assistant entry, each with its own visual marker:
     //
     // - **streaming** (`state.streaming_assistant == Some(idx)`): a braille
@@ -500,9 +500,24 @@ fn render_chat_lines(state: &AppState) -> Vec<Line<'static>> {
                     ),
                 ]));
                 let args_str = serde_json::to_string(args).unwrap_or_default();
+                // Tool-call payloads are JSON dumps that frequently span
+                // 100+ chars on a single line. We want the chat log to stay
+                // scannable: take only the first line of the JSON, and
+                // smart-truncate to the panel width with a trailing `…` so
+                // the row never wraps and never overflows the panel.
+                let first_line = args_str.lines().next().unwrap_or("");
+                let budget = max_width.saturating_sub(3);
+                let shown = if first_line.chars().count() > budget && budget > 0 {
+                    let keep = budget.saturating_sub(1);
+                    let mut s: String = first_line.chars().take(keep).collect();
+                    s.push('…');
+                    s
+                } else {
+                    first_line.to_string()
+                };
                 out.push(Line::from(vec![
                     Span::styled("   ", Style::default()),
-                    Span::styled(args_str, Style::default().fg(theme::ACCENT2)),
+                    Span::styled(shown, Style::default().fg(theme::ACCENT2)),
                 ]));
             }
             ChatMsg::Assistant { agent, text } => {

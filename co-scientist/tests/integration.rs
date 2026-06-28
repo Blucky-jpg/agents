@@ -434,9 +434,26 @@ fn all_14_prompts_render_with_minimum_vars() {
         // Vars used by evolution_out_of_box (iterates over a list of
         // hypotheses with `h.id` and `h.text`).
         ctx.set_value("hypotheses", serde_json::json!([{"id":"H-1","text":"h"}]));
+        // Vars used by the new experiment modes and reflection_on_result.
+        ctx.set("experiment_id", "E-1");
+        ctx.set("metric_name", "m");
+        ctx.set("code", "print(1+1)");
+        ctx.set("description", "demo");
+        ctx.set("status", "succeeded");
+        ctx.set("metric_value", "1.0");
+        ctx.set("exit_code", "0");
+        ctx.set("duration_ms", "10");
+        ctx.set("stdout", "(empty)");
+        ctx.set("stderr", "(empty)");
+        ctx.set("verdict", "supports");
+        ctx.set("result_summary", "(see details)");
+        ctx.set("result_details", "{}");
+        ctx.set("prior_review", "(none)");
         let out = p
             .render(*mode, &ctx)
-            .unwrap_or_else(|e| panic!("rendering {} failed: {e}", mode.filename()));
+            .unwrap_or_else(|e| {
+                panic!("rendering {} failed: {e:#?}", mode.filename());
+            });
         assert!(!out.is_empty(), "{} rendered empty", mode.filename());
     }
 }
@@ -757,13 +774,13 @@ async fn compress_events_tool_saves_summary() {
 // ---------- Community prompts + agent rename ----------
 
 #[test]
-fn six_agents_match_community_names() {
+fn seven_agents_match_community_names() {
     use co_scientist::agents::AGENTS;
     let names: Vec<&str> = AGENTS.iter().map(|a| a.name).collect();
     assert_eq!(
         names,
-        vec!["supervisor", "generation", "reflection", "ranking", "evolution", "metareview"],
-        "agents should be the 6 community/paper agents"
+        vec!["supervisor", "generation", "reflection", "ranking", "evolution", "metareview", "experiment"],
+        "agents should be the 7 co-scientist agents (experiment added for the empirical loop)"
     );
 }
 

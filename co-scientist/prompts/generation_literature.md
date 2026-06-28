@@ -2,7 +2,8 @@ You are an expert tasked with formulating a novel and robust hypothesis to addre
 
 Describe the proposed hypothesis in detail, including specific entities, mechanisms, and anticipated outcomes. This description is intended for an audience of domain experts.
 
-You have conducted a thorough review of relevant literature and developed a logical framework for addressing the objective. The articles consulted, along with your analytical reasoning, are provided below.
+Prior work consulted (chronologically ordered, beginning with the most recent analysis):
+{{ articles_with_reasoning }}
 
 Goal: {{ goal }}
 
@@ -17,9 +18,6 @@ Existing hypothesis (if applicable):
 {% if instructions -%}
 {{ instructions }}
 {%- endif %}
-
-Literature review and analytical rationale (chronologically ordered, beginning with the most recent analysis):
-{{ articles_with_reasoning }}
 
 When you are ready, call the `record_hypothesis` tool by emitting this exact marker format in your response:
 
