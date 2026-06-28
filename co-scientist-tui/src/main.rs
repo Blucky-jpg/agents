@@ -27,6 +27,7 @@
 
 mod app;
 mod ipc;
+mod markdown;
 mod splash;
 mod supervisor_session;
 mod theme;
@@ -35,7 +36,7 @@ mod ui;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
@@ -51,11 +52,10 @@ use ratatui::Terminal;
 use tokio::sync::{mpsc, Mutex};
 use tracing_subscriber::EnvFilter;
 
-use co_scientist::bus::MemoryEvent;
 use co_scientist::runner::RunnerConfig;
 use co_scientist::Memory;
 
-use crate::app::{sidebar_entry, should_drop_bus_event, AppState, Busy, ChatMsg, Focus, SharedState};
+use crate::app::{AppState, Busy, ChatMsg, Focus, SharedState};
 use crate::ipc::{AgentToUi, UiToAgent};
 
 #[tokio::main]
@@ -200,198 +200,10 @@ async fn run_app(terminal: &mut Term, db_path: PathBuf) -> Result<()> {
 }
 
 async fn handle_agent_msg(state: &SharedState, msg: AgentToUi) {
-    let mut s = state.lock().await;
-    match msg {
-        AgentToUi::TurnStarted { model } => {
-            s.busy = Busy::Running;
-            s.status = "calling claude CLI…".to_string();
-            s.model = model;
-            // Reset the partial-marker carry at the start of every turn so
-            // any unconsumed marker tail from a prior (failed/aborted) turn
-            // never leaks into the new turn's text.
-            s.partial_marker_carry.clear();
-            // Pre-create the assistant entry that deltas will accumulate into.
-            // Empty text now; `TurnDelta` appends; `TurnDone` finalizes.
-            const LOG_CAP: usize = 1000;
-            let agent_name = s.current_agent_name().to_string();
-            s.log.push(ChatMsg::Assistant {
-                agent: agent_name,
-                text: String::new(),
-            });
-            let cap_drop = s.log.len().saturating_sub(LOG_CAP);
-            if cap_drop > 0 {
-                s.log.drain(0..cap_drop);
-            }
-            s.streaming_assistant = Some(s.log.len() - 1);
-        }
-        AgentToUi::TurnDelta { agent_name, delta } => {
-            // Scrub `[[MEMORY_OP:…: {json} ]]` markers from the delta BEFORE
-            // mutating the log. `TurnDelta` carries RAW text; marker
-            // parsing only happens at `TurnDone`. Without this scrub the
-            // raw marker renders as a plain markdown paragraph in the live
-            // log until `TurnDone` strips it (the user screenshot showed
-            // `memory_add` leaking during streaming). The scrubber runs
-            // outside the `s.log.get_mut(idx)` borrow so the carry field
-            // can be mutated independently.
-            let scrubbed = scrub_markers(&mut s.partial_marker_carry, &delta);
-            if let Some(idx) = s.streaming_assistant
-                && let Some(ChatMsg::Assistant { agent, text }) = s.log.get_mut(idx)
-            {
-                // The agent name is set once on TurnStarted; subsequent
-                // deltas carry it for redundancy but we trust the entry.
-                if agent.is_empty() {
-                    *agent = agent_name;
-                }
-                if !scrubbed.is_empty() {
-                    text.push_str(&scrubbed);
-                }
-                s.follow_tail = true;
-            }
-        }
-        AgentToUi::TurnDone {
-            cleaned_text,
-            markers,
-            agent_name,
-        } => {
-            // Replace the streamed raw text with the cleaned/marker-augmented
-            // final form. If the streaming entry exists, mutate in place;
-            // otherwise (shouldn't happen, but defensively) append a fresh one.
-            let mut final_text = cleaned_text;
-            if !markers.is_empty() {
-                let ops: Vec<String> = markers.iter().map(|m| m.op.clone()).collect();
-                final_text.push_str(&format!("\n  ⚙ {}", ops.join(", ")));
-                // Also push a ChatMsg::ToolCall entry for each parsed marker
-                // so the visual layout distinguishes the tool call from the
-                // surrounding assistant text. We emit one entry per marker
-                // (not one per op) so the JSON payload is visible.
-                for m in &markers {
-                    s.log.push(ChatMsg::ToolCall {
-                        agent: agent_name.clone(),
-                        tool: m.op.clone(),
-                        args: m.payload.clone(),
-                    });
-                }
-            }
-            if let Some(idx) = s.streaming_assistant.take() {
-                if let Some(ChatMsg::Assistant { agent, text }) = s.log.get_mut(idx) {
-                    *agent = agent_name;
-                    *text = final_text;
-                }
-            } else {
-                s.push_log(ChatMsg::Assistant {
-                    agent: agent_name,
-                    text: final_text,
-                });
-            }
-            // Drop any leftover carry — the marker stream ended cleanly.
-            s.partial_marker_carry.clear();
-            s.busy = Busy::Idle;
-            s.status = "ready".to_string();
-            s.follow_tail = true;
-        }
-        AgentToUi::TurnFailed { error, agent_name } => {
-            // Remove the empty streaming entry if present so the log doesn't
-            // show a blank assistant row.
-            if let Some(idx) = s.streaming_assistant.take()
-                && let Some(ChatMsg::Assistant { text, .. }) = s.log.get(idx)
-                && text.is_empty()
-            {
-                s.log.remove(idx);
-            }
-            s.push_log(ChatMsg::System(format!("[{agent_name}] turn failed: {error}")));
-            // Drop any leftover carry — the marker stream never completed.
-            s.partial_marker_carry.clear();
-            s.busy = Busy::Idle;
-            s.status = "error".to_string();
-            s.follow_tail = true;
-        }
-        AgentToUi::SupervisorStarted {
-            session_id,
-            stop_tx,
-        } => {
-            s.supervisor_running = true;
-            s.supervisor_session = Some(session_id.clone());
-            s.supervisor_started_at = Some(Instant::now());
-            s.supervisor_stop_tx = Some(stop_tx);
-            s.tasks_done = 0;
-            s.tasks_failed = 0;
-            s.tasks.clear();
-            s.status = format!("supervisor session {session_id}");
-            s.input.clear();
-            s.follow_tail = true;
-            s.push_log(ChatMsg::System(format!(
-                "supervisor session started: {session_id}"
-            )));
-        }
-        AgentToUi::SupervisorEvent(ev) => {
-            // Route to sidebar where applicable.
-            if let Some(se) = sidebar_entry(&ev) {
-                match se {
-                    crate::app::SidebarEvent::Task(t) => {
-                        match t.status {
-                            crate::app::TaskStatus::Done => s.tasks_done += 1,
-                            crate::app::TaskStatus::Failed => s.tasks_failed += 1,
-                            _ => {}
-                        }
-                        s.push_task(t);
-                    }
-                    crate::app::SidebarEvent::Memory(m) => s.push_memory(m),
-                }
-            }
-            // Suppress high-volume telemetry from the chat log.
-            if should_drop_bus_event(&ev) {
-                return;
-            }
-            s.push_log(ChatMsg::System(render_bus_event(&ev)));
-            s.follow_tail = true;
-        }
-        AgentToUi::SupervisorFinished { reason, session_id } => {
-            s.supervisor_running = false;
-            s.supervisor_started_at = None;
-            s.supervisor_stop_tx = None;
-            s.status = format!("session {session_id} done: {reason}");
-            s.push_log(ChatMsg::System(format!(
-                "supervisor finished: {reason}"
-            )));
-        }
-        AgentToUi::SupervisorFailed { error } => {
-            s.supervisor_running = false;
-            s.supervisor_started_at = None;
-            s.supervisor_stop_tx = None;
-            s.status = "supervisor failed".to_string();
-            s.push_log(ChatMsg::System(format!("supervisor failed: {error}")));
-        }
-    }
+    let mut guard = state.lock().await;
+    crate::app::reducers::reduce(msg, &mut guard);
 }
 
-fn render_bus_event(ev: &MemoryEvent) -> String {
-    match ev {
-        MemoryEvent::EventLogged {
-            agent, type_, payload, ..
-        } => match payload {
-            Some(p) => format!("· {agent} {type_} {}", compact_json(p)),
-            None => format!("· {agent} {type_}"),
-        },
-        MemoryEvent::MarkerFailed { agent, op, error } => {
-            format!("! marker {op} from {agent}: {error}")
-        }
-        _ => String::new(),
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(n).collect();
-        format!("{cut}…")
-    }
-}
-
-fn compact_json(v: &serde_json::Value) -> String {
-    let s = v.to_string();
-    truncate(&s, 80)
-}
 
 async fn handle_key(
     state: &SharedState,
@@ -853,7 +665,7 @@ async fn rebuild_runner(
 /// as a single `ParsedResponse`. Streaming the cleaned text back per delta
 /// is awkward (the same content would be re-emitted as the parser sees
 /// more text) and would break the existing dedup contract in `query_stream`.
-fn scrub_markers(carry_in: &mut String, delta: &str) -> String {
+pub(crate) fn scrub_markers(carry_in: &mut String, delta: &str) -> String {
     let mut buf = String::with_capacity(carry_in.len() + delta.len());
     std::mem::swap(&mut buf, carry_in);
     buf.push_str(delta);

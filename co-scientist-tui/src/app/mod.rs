@@ -15,6 +15,8 @@ use tokio::sync::{watch, Mutex};
 
 use co_scientist::bus::MemoryEvent;
 
+pub mod reducers;
+
 /// Which panel has keyboard focus. `Tab`/`Shift+Tab` cycles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -215,8 +217,8 @@ pub struct AppState {
     pub show_splash: bool,
 }
 
-const LOG_CAP: usize = 1000;
-const SIDEBAR_CAP: usize = 64;
+pub(crate) const LOG_CAP: usize = 1000;
+pub(crate) const SIDEBAR_CAP: usize = 64;
 
 impl AppState {
     pub fn new(run_id: String) -> Self {
