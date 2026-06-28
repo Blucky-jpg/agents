@@ -30,12 +30,14 @@ pub mod claude_cli;
 pub mod db;
 pub mod elo;
 pub mod embeddings;
+pub mod experiment;
 pub mod llm_query;
 pub mod hypothesis;
 pub mod marker_normalizer;
 pub mod memory;
 pub mod policies;
 pub mod prompts;
+pub mod prompt_allowlist;
 pub mod promotion;
 pub mod queue;
 pub mod registry;
@@ -52,7 +54,10 @@ pub mod tournament;
 pub mod worker;
 
 pub use agents::Agent;
-pub use bus::{EventBus, MemoryEvent};
+pub use bus::{
+    run_failure_aggregator, EventBus, FailureAggregatorConfig, FailureCount, MemoryEvent,
+};
+pub use experiment::{Experiment, ExperimentRepo, ExperimentStatus, RunResult};
 pub use db::{open, Db};
 pub use memory::{
     cite, approx_tokens, Context, Event, Memory, MemoryError, Observation, ObservationKind,
@@ -64,7 +69,7 @@ pub use prompts::{AgentMode, Prompts, PromptContext, PROMPT_MODES};
 pub use promotion::{ConsolidationService, PromotionConfig};
 pub use queue::{EnqueueRequest, Task, TaskQueue, TaskStatus};
 pub use registry::{default_allowlist, ToolRegistry};
-pub use run_agent::RunAgentTool;
+pub use run_agent::{RunAgentTool, SessionRunners};
 pub use runner::{Runner, RunnerConfig};
 pub use skill::{parse_markers, Marker, SKILL};
 pub use skill_loader::{discover as discover_skills, into_tool as skill_to_tool, LoadedSkill};
