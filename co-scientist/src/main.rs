@@ -240,13 +240,8 @@ async fn cmd_run(args: &[String], db_path: &str) -> Result<()> {
 }
 
 async fn cmd_start(args: &[String], db_path: &str) -> Result<()> {
-    use co_scientist::run_agent::RunAgentTool;
-    use co_scientist::supervisor::{Supervisor, SupervisorConfig};
-    use co_scientist::queue::TaskQueue;
-    use co_scientist::registry::ToolRegistry;
-    use co_scientist::tool::builtin_tools;
-    use co_scientist::worker::{ctrl_c_shutdown_pair, run_worker, WorkerConfig};
-    use std::sync::Arc;
+    use co_scientist::supervisor::SupervisorConfig;
+    use co_scientist::supervisor_bundle::{self, Config as BundleConfig};
 
     let goal = positional_after_flags(args).context("-- \"goal text\" is required")?;
     let preferences = arg_value(args, "--preferences").unwrap_or_default();
@@ -264,63 +259,6 @@ async fn cmd_start(args: &[String], db_path: &str) -> Result<()> {
         .unwrap_or(3);
 
     let session_id = co_scientist::memory::new_run_id();
-    // The connection returned by db::open here is intentionally unused —
-    // supervisor, worker, and consolidation each open their OWN fresh
-    // connection below because rusqlite::Connection is single-threaded
-    // and sharing one across concurrent components triggers "concurrent
-    // use forbidden".
-    let _d = db::open(db_path).await?;
-    let bus = co_scientist::EventBus::default();
-    let mem = co_scientist::Memory::with_bus(
-        Db::new(Db::connect_fresh(db_path).await?),
-        bus.clone(),
-    );
-    let worker_mem = co_scientist::Memory::with_bus(
-        Db::new(Db::connect_fresh(db_path).await?),
-        bus.clone(),
-    );
-    let consolidation_mem = co_scientist::Memory::with_bus(
-        Db::new(Db::connect_fresh(db_path).await?),
-        bus.clone(),
-    );
-
-    // Build registry with all tools.
-    let mut reg = ToolRegistry::new();
-    reg.register_all(builtin_tools());
-
-    let skills_dir = std::path::PathBuf::from(
-        env::var("CO_SCIENTIST_SKILLS").unwrap_or_else(|_| "co_scientist_skills".to_string()),
-    );
-    if skills_dir.exists() {
-        for s in co_scientist::discover_skills(&skills_dir)? {
-            reg.register(co_scientist::skill_to_tool(s));
-        }
-    }
-
-    let prompts = Arc::new(co_scientist::Prompts::new()?);
-    let q = TaskQueue::new(Db::new(Db::connect_fresh(db_path).await?));
-
-    // Register the RunAgentTool (handles agent execution + follow-ups).
-    let run_agent_tool = RunAgentTool::new(
-        q.clone(),
-        prompts.clone(),
-        Arc::new(reg.clone()),
-        co_scientist::runner::RunnerConfig::default(),
-    );
-    reg.register(Arc::new(run_agent_tool));
-
-    let reg = Arc::new(reg);
-    let (shutdown_tx, shutdown_rx) = ctrl_c_shutdown_pair();
-
-    // Spawn the consolidation service.
-    let consolidation_cfg = co_scientist::PromotionConfig::default();
-    let consolidation_shutdown = shutdown_rx.clone();
-    let consolidation_handle = tokio::spawn(async move {
-        let svc = co_scientist::ConsolidationService::new(consolidation_mem, consolidation_cfg);
-        if let Err(e) = svc.run(bus, consolidation_shutdown).await {
-            tracing::error!(error = %e, "consolidation service failed");
-        }
-    });
 
     let sup_config = SupervisorConfig {
         budget_usd: budget,
@@ -328,6 +266,10 @@ async fn cmd_start(args: &[String], db_path: &str) -> Result<()> {
         concurrency,
         n_initial,
         ..Default::default()
+    };
+    let cfg = BundleConfig {
+        supervisor: sup_config,
+        ..BundleConfig::default()
     };
 
     eprintln!("starting research session {}", session_id);
@@ -339,37 +281,34 @@ async fn cmd_start(args: &[String], db_path: &str) -> Result<()> {
         eprintln!("deadline: {}s", deadline_secs);
     }
 
-    // Spawn the worker with its OWN connection.
-    let worker_q = q.clone();
-    let worker_reg = reg.clone();
-    let worker_shutdown = shutdown_rx.clone();
-    let worker_handle = tokio::spawn(async move {
-        let cfg = WorkerConfig::default();
-        if let Err(e) = run_worker(worker_mem, worker_q, worker_reg, cfg, worker_shutdown).await {
-            tracing::error!(error = %e, "worker failed");
-        }
-    });
-
-    // Run the supervisor (blocks until done).
-    Supervisor::run(
-        mem.clone(),
-        q.clone(),
-        reg.clone(),
-        prompts,
-        sup_config,
+    // The CLI doesn't have an external stop signal (no UI to send
+    // `/stop`), so we hand the bundle the Ctrl+C pair directly. The
+    // bundle doesn't own SIGINT — see the supervisor_bundle doc
+    // comment for why this matters.
+    let (_shutdown_tx, shutdown_rx) = co_scientist::worker::ctrl_c_shutdown_pair();
+    let bus = co_scientist::EventBus::default();
+    let outcome = supervisor_bundle::run(
+        db_path.to_string().into(),
+        bus,
         session_id.clone(),
         goal,
         preferences,
-        shutdown_rx.clone(),
-        shutdown_tx.clone(),
+        cfg,
+        shutdown_rx,
     )
     .await?;
 
-    // Wait for worker and consolidation to shut down.
-    let _ = worker_handle.await;
-    let _ = consolidation_handle.await;
-
-    eprintln!("session {} complete", session_id);
+    let reason = match outcome.supervisor {
+        Ok(()) => "ok".to_string(),
+        Err(e) => format!("error: {e:#}"),
+    };
+    eprintln!("session {} complete: {}", session_id, reason);
+    // Surface fatal bundle wiring errors (DB unreachable, etc.) as
+    // exit code 1 — previously this happened implicitly when
+    // `Supervisor::run` returned Err. Now the bundle returns
+    // `BundleOutcome` which only has the supervisor's Result; wiring
+    // errors propagate as `Err` from the outer `run` and we convert
+    // them to a non-zero exit here.
     Ok(())
 }
 

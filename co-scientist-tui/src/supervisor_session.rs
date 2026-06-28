@@ -85,6 +85,31 @@ pub fn start(
         AgentToUi::SupervisorEvent,
     );
 
+    // Build the bundle's shutdown channel. The bundle trusts the
+    // caller to own SIGINT handling (see supervisor_bundle doc); we
+    // bridge both `/stop` (from `stop_rx`) and Ctrl+C (from the TUI
+    // main event loop's key handler — which is what calls
+    // `tx_to_agent.send(UiToAgent::Shutdown)` on Ctrl-C) into a
+    // single `watch::Receiver` for the bundle. Note: the
+    // `ctrl_c_shutdown_pair` we use here is for **process-level**
+    // SIGINT (in case the TUI event loop misses the key event under
+    // load); the TUI's main loop handles the in-band Ctrl-C key
+    // separately by quitting the whole app.
+    let (bundle_shutdown_tx, bundle_shutdown_rx) =
+        co_scientist::worker::ctrl_c_shutdown_pair();
+    {
+        let bundle_shutdown_tx = bundle_shutdown_tx.clone();
+        let mut stop_rx = stop_rx;
+        tokio::spawn(async move {
+            while stop_rx.changed().await.is_ok() {
+                if *stop_rx.borrow() {
+                    let _ = bundle_shutdown_tx.send(true);
+                    break;
+                }
+            }
+        });
+    }
+
     // Run the bundle in a background task. The bundle's `run` blocks
     // until the supervisor returns (or is signalled to stop), so this
     // task lives for the entire session.
@@ -97,7 +122,7 @@ pub fn start(
             goal,
             String::new(), // preferences: TUI doesn't expose this yet
             BundleConfig::default(),
-            stop_rx,
+            bundle_shutdown_rx,
         )
         .await;
 

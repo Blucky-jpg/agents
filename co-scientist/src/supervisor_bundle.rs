@@ -64,7 +64,7 @@ use crate::run_agent::RunAgentTool;
 use crate::runner::RunnerConfig;
 use crate::supervisor::{Supervisor, SupervisorConfig};
 use crate::tool::builtin_tools;
-use crate::worker::{ctrl_c_shutdown_pair, run_worker, WorkerConfig};
+use crate::worker::{run_worker, WorkerConfig};
 
 /// Configuration for the full supervisor stack. Only the pieces that
 /// *vary* between calls are exposed; everything else stays at the
@@ -82,11 +82,23 @@ pub struct Config {
 ///
 /// ## Shutdown signaling
 ///
-/// `external_stop` is the caller's external shutdown signal (the TUI's
-/// `/stop` slash command pipes into it). The bundle bridges it into the
-/// internal `ctrl_c_shutdown_pair` so a `/stop` from the UI and a Ctrl+C
-/// from the terminal both wind the pipeline down the same way. The
-/// caller never needs to know about the internal pair.
+/// `shutdown` is the only shutdown signal the bundle listens on. The
+/// caller is responsible for constructing it — typically with
+/// `co_scientist::worker::ctrl_c_shutdown_pair()` (which gives you a
+/// `watch::Receiver<bool>` that flips on Ctrl+C) and an additional
+/// external stop signal merged into the same channel via
+/// `watch::Sender::send`.
+///
+/// **Why the bundle doesn't create its own Ctrl+C handler**:
+/// the original bundle design (C1) created an internal
+/// `ctrl_c_shutdown_pair` and bridged the caller's `external_stop`
+/// into it. That meant the CLI's call to `ctrl_c_shutdown_pair()` for
+/// the bundle's `external_stop` parameter would *race* with the
+/// bundle's internal pair — two tokio tasks listening for SIGINT.
+/// Both fire, both forward, all correct, but wasteful and confusing.
+/// The new design trusts the caller to own SIGINT handling. The TUI's
+/// `supervisor_session::start` and the CLI's `cmd_start` both build
+/// the pair the same way; the bundle sees a single receiver.
 ///
 /// ## Event bus
 ///
@@ -104,7 +116,7 @@ pub async fn run(
     goal: String,
     preferences: String,
     cfg: Config,
-    external_stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<BundleOutcome> {
     // Open one connection here only to confirm the DB is reachable. The
     // supervisor, worker, and consolidation each open their OWN fresh
@@ -134,18 +146,18 @@ pub async fn run(
     let reg = build_registry(&q, &prompts, &cfg.runner)?;
     let reg = Arc::new(reg);
 
-    let (shutdown_tx, shutdown_rx) = ctrl_c_shutdown_pair();
-
-    // Bridge the caller's external stop signal (e.g. TUI `/stop`) into
-    // the internal shutdown channel. When `external_stop` flips to
-    // `true`, we mirror it onto `shutdown_tx` so the worker /
-    // consolidation / supervisor all observe the same shutdown.
+    // The bundle does not own SIGINT — see the doc comment above for
+    // why. We bridge the caller's `shutdown` into an internal pair
+    // (which has NO SIGINT listener of its own) so the worker /
+    // consolidation / supervisor all observe the same shutdown, and
+    // the bundle can also signal wind-down via the internal `Sender`.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     {
         let shutdown_tx = shutdown_tx.clone();
-        let mut external_stop = external_stop;
+        let mut shutdown = shutdown;
         tokio::spawn(async move {
-            while external_stop.changed().await.is_ok() {
-                if *external_stop.borrow() {
+            while shutdown.changed().await.is_ok() {
+                if *shutdown.borrow() {
                     let _ = shutdown_tx.send(true);
                     break;
                 }
