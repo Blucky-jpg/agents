@@ -1,12 +1,11 @@
 # Agents
 
-An automated research lab. Two Rust crates plus a TUI:
+An automated research lab. Two Rust crates:
 
 | Crate | Role |
 |---|---|
 | [`ante-preview/`](ante-preview/) | AI agent runtime (vendored snapshot of upstream) |
 | [`co-scientist/`](co-scientist/) | Memory layer + 7-agent research pipeline + empirical loop |
-| [`co-scientist-tui/`](co-scientist-tui/) | Terminal UI for live session interaction |
 
 ## The project
 
@@ -41,10 +40,6 @@ The memory layer and 7-agent pipeline. Key entry points:
 - **`Worker`** (`src/worker.rs`) — durable task loop. Claims tasks from `TaskQueue`, dispatches via `ToolRegistry`, panic-safe, lease-protected.
 - **`TaskQueue`** (`src/queue.rs`) — SQLite-backed durable queue with leases, retries, idempotency keys.
 - **`Memory`** (`src/memory/`) — SQLite-backed handle. Persistence split by table: `events`, `agents`, `semantic_memories`, `behavior_memories`, `sessions`. Plus `context.rs` for the 3-layer retrieval pattern (peek → timeline → observation).
-
-### [`co-scientist-tui/`](co-scientist-tui/)
-
-Terminal UI. Live chat log of streamed LLM deltas, task queue status, agent state. Subscribes to the same `EventBus` the worker uses — sees events as they happen, no polling.
 
 ## Tools (18 total)
 
@@ -97,7 +92,7 @@ Tests don't need an LLM. Co-scientist requires Node.js ≥ 22 only if you wire t
 cargo run -p co-scientist -- start --goal "What makes compounds selective for KRAS-G12C over KRAS-G12D?"
 ```
 
-The supervisor parses the goal into a plan, enqueues initial generation tasks, then the worker pool runs them through the pipeline. Results stream to the TUI.
+The supervisor parses the goal into a plan, enqueues initial generation tasks, then the worker pool runs them through the pipeline.
 
 ## Repo layout
 
@@ -162,9 +157,6 @@ The supervisor parses the goal into a plan, enqueues initial generation tasks, t
 │   │       ├── behavior.rs
 │   │       └── context.rs
 │   └── tests/integration.rs
-├── co-scientist-tui/       # terminal UI
-│   ├── Cargo.toml
-│   └── src/
 ├── ref/                    # upstream reference repos surveyed for design ideas
 │   └── (8 reference projects: ai-agent-os, claudelicious, claude-mem, …)
 └── reports/                # 7 design reports on memory-system architectures

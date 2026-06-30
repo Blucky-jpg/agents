@@ -22,9 +22,6 @@ members = [
 
     # ---- Co-scientist (local memory layer, no ante fork) ----
     "co-scientist",
-
-    # ---- TUI front-end for co-scientist ----
-    "co-scientist-tui",
 ]
 
 # What `cargo build` (no args) actually builds. Kept small to keep the
@@ -34,7 +31,6 @@ default-members = [
     "ante-preview/crates/exec",
     "ante-preview/crates/protocol-shape",
     "co-scientist",
-    "co-scientist-tui",
 ]
 
 [workspace.package]
@@ -101,6 +97,7 @@ debug = "line-tables-only"
 codegen-units = 4
 panic = "abort"
 lto = "thin"
+strip = "symbols"
 
 [profile.release-official]
 inherits = "release"
