@@ -156,68 +156,12 @@ fn check_type(key: &str, value: &Value, schema: &Value) -> Result<()> {
 /// Default per-agent allowlist for the 6 co-scientist roles. The
 /// community's tool names are accepted on top of our local names; the
 /// registry rewrites them via [`crate::marker_normalizer::canonicalize`].
+///
+/// This is a thin re-export of [`crate::tool_catalog::default_allowlist`]
+/// so callers that imported `default_allowlist` from `registry` keep
+/// working. The actual source of truth is the catalog.
 pub fn default_allowlist(agent: &str) -> Option<Vec<&'static str>> {
-    let research = vec![
-        "save_semantic",
-        "save_behavior",
-        "get_context",
-        "compress_events",
-        // 3-layer retrieval (peek → timeline → get_observation)
-        "peek_context",
-        "get_timeline",
-        "get_observation",
-        // structured research tools
-        "record_hypothesis",
-        "record_review",
-        "record_tournament_match",
-        // community aliases — accepted as-is, rewritten by the runner
-        "record_system_feedback",
-        "record_research_plan",
-    ];
-    let archive_tools = vec!["archive_observation", "delete_observation"];
-    let ranking_only = vec!["record_tournament_match"];
-    let experiment_tools = vec![
-        // Empirical loop. `save_semantic` + `record_review` let the
-        // experiment agent record its designs/results and contribute
-        // back to the tournament.
-        "save_semantic",
-        "save_behavior",
-        "get_context",
-        "peek_context",
-        "get_timeline",
-        "get_observation",
-        "design_experiment",
-        "execute_experiment",
-        "evaluate_result",
-        "record_review",
-    ];
-    match agent {
-        // Supervisor parses the goal into a research plan (calls
-        // `record_research_plan`, which canonicalizes to
-        // `save_semantic` with scope="plan") and curates its own
-        // session (archive / delete junk observations). The prompt
-        // ↔ allowlist validator enforces that both sides agree.
-        "supervisor" => {
-            let mut v = vec!["save_semantic", "record_research_plan"];
-            v.extend(archive_tools.iter().copied());
-            Some(v)
-        }
-        // Ranking only needs the tournament match tool.
-        "ranking" => Some(ranking_only),
-        // Research agents get the full set; metareview can also curate.
-        "generation" | "reflection" | "evolution" => Some(research),
-        "metareview" => {
-            let mut v = research;
-            v.extend(archive_tools.iter().copied());
-            Some(v)
-        }
-        // Experiment agent — the empirical loop.
-        "experiment" => Some(experiment_tools),
-        // Legacy / pre-refactor names.
-        "literature" | "hypothesis" | "analysis" | "critic"
-        | "synthesizer" => Some(research),
-        _ => Some(research),
-    }
+    crate::tool_catalog::default_allowlist(agent)
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::elo::{self, Winner};
 use crate::hypothesis::{HypothesisRepo, HypothesisState};
-use crate::tournament::TournamentRepo;
+use crate::tournament::matches::TournamentRepo;
 
 use super::{Tool, ToolCtx, ToolOutput};
 

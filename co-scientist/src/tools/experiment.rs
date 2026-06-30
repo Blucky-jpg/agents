@@ -29,7 +29,7 @@ use super::{Tool, ToolCtx, ToolOutput};
 /// workloads, not full ML training. Override per-call via the schema's
 /// optional fields.
 const DEFAULT_TIMEOUT_S: u64 = 30;
-const DEFAULT_MEM_MB: u64 = 256;
+const DEFAULT_MEM_MB: u64 = 1536;
 
 // =====================================================================
 // design_experiment
@@ -470,6 +470,131 @@ impl Tool for EvaluateResultTool {
     }
 }
 
+// =====================================================================
+// run_python
+// =====================================================================
+
+/// Synchronous inline Python execution. Unlike `design_experiment` +
+/// `execute_experiment` (which persist a row in the `experiments` table
+/// and feed `evaluate_result` → `reflection_on_result`), this tool runs
+/// the supplied code directly and returns stdout/stderr/exit_code.
+///
+/// **Blocking contract**: the tool's `call` does not return until the
+/// subprocess has exited, errored, or hit the wall-clock timeout. The
+/// next LLM turn only begins after this tool returns. There is no
+/// streaming, no early-return, no background execution.
+///
+/// **Use for**: quick numeric / sanity-check computations, one-off
+/// data transforms, sanity-checking a hypothesis's algebra before
+/// designing a full experiment. **Don't use for**: long-running jobs
+/// (over the timeout cap), or anything that should be auditable as a
+/// hypothesis-driven experiment — those should go through the
+/// `design_experiment` → `execute_experiment` path so the run is
+/// persisted.
+///
+/// **Sandbox**: spawned in a fresh `tempfile::TempDir` as cwd, stdin
+/// closed, stdout/stderr piped. The tempdir is dropped on return,
+/// deleting any files the script created. `mem_mb` is currently
+/// advisory only — see `run_python_code` for the caveat.
+pub struct RunPythonTool;
+
+#[async_trait]
+impl Tool for RunPythonTool {
+    fn name(&self) -> &str {
+        "run_python"
+    }
+    fn description(&self) -> String {
+        "Run a Python snippet inline. Synchronous: this call blocks until the \
+         script finishes (success, non-zero exit, syntax error, or wall-clock \
+         timeout). The next LLM turn only starts after this returns. Runs in a \
+         fresh tempdir; stdout/stderr/exit_code/duration are returned. Use for \
+         quick computations or sanity checks. For auditable hypothesis-driven \
+         runs, prefer design_experiment + execute_experiment instead."
+            .to_string()
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source to run via `python3 -c <code>`. Newlines are fine."
+                },
+                "timeout_s": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 600,
+                    "default": DEFAULT_TIMEOUT_S,
+                    "description": "Wall-clock timeout in seconds. The subprocess is killed and the tool returns with status=timed_out after this many seconds."
+                },
+                "mem_mb": {
+                    "type": "integer",
+                    "minimum": 16,
+                    "maximum": 4096,
+                    "default": DEFAULT_MEM_MB,
+                    "description": "Memory budget in MB. Currently advisory only — the timeout is the hard cap."
+                }
+            },
+            "required": ["code"]
+        })
+    }
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let code = args
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("run_python: missing 'code'"))?;
+        let timeout_s = args
+            .get("timeout_s")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_TIMEOUT_S);
+        let mem_mb = args
+            .get("mem_mb")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_MEM_MB);
+
+        let timeout = std::time::Duration::from_secs(timeout_s);
+
+        // Audit: log the call. We log code length, not the code itself,
+        // since (a) the code can be large and (b) the full output of the
+        // run is captured in the events table below via run_id + agent
+        // for any later replay.
+        if let Err(e) = ctx
+            .memory
+            .log_event(
+                &ctx.run_id,
+                &ctx.agent_name,
+                0,
+                "python_executed",
+                Some(json!({
+                    "code_bytes": code.len(),
+                    "timeout_s": timeout_s,
+                    "mem_mb": mem_mb,
+                })),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                "log_event failed for python_executed"
+            );
+        }
+
+        // This is the blocking call. We do not return until the
+        // subprocess has exited, errored, or been killed by the timeout.
+        // The next LLM turn starts only after this future resolves.
+        let result = run_python_code(code, timeout, mem_mb).await;
+
+        Ok(json!({
+            "status": result.status.as_str(),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration_ms,
+            "runner_error": result.runner_error,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,5 +742,96 @@ mod tests {
             Some(0.5)
         );
         assert_eq!(parse_metric_from_stdout("hello", "value"), None);
+    }
+
+    /// `run_python` happy path: stdout/exit_code/status all come back.
+    /// Confirms the synchronous-blocking contract by construction —
+    /// the `await` below cannot resolve until the subprocess has exited.
+    #[tokio::test]
+    async fn run_python_tool_returns_succeeded_on_clean_exit() {
+        use crate::db;
+        let mem = Memory::new(db::open_memory().await.unwrap());
+        let ctx = ToolCtx {
+            memory: mem,
+            run_id: "r-py".into(),
+            agent_name: "generation".into(),
+        };
+        let out = RunPythonTool
+            .call(json!({"code": "print(2 + 2)"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "succeeded");
+        assert_eq!(out["exit_code"].as_i64().unwrap(), 0);
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "4");
+    }
+
+    /// `run_python` failure path: a non-zero exit returns `status=failed`
+    /// with stderr populated. Synchronous: the next LLM turn only sees
+    /// this result after the tool returns.
+    #[tokio::test]
+    async fn run_python_tool_returns_failed_on_nonzero_exit() {
+        use crate::db;
+        let mem = Memory::new(db::open_memory().await.unwrap());
+        let ctx = ToolCtx {
+            memory: mem,
+            run_id: "r-py".into(),
+            agent_name: "reflection".into(),
+        };
+        let out = RunPythonTool
+            .call(
+                json!({"code": "import sys; sys.stderr.write('boom'); sys.exit(7)"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "failed");
+        assert_eq!(out["exit_code"].as_i64().unwrap(), 7);
+        assert!(out["stderr"].as_str().unwrap().contains("boom"));
+    }
+
+    /// `run_python` missing required field: validation error, no
+    /// subprocess spawned.
+    #[tokio::test]
+    async fn run_python_tool_rejects_missing_code() {
+        use crate::db;
+        let mem = Memory::new(db::open_memory().await.unwrap());
+        let ctx = ToolCtx {
+            memory: mem,
+            run_id: "r-py".into(),
+            agent_name: "generation".into(),
+        };
+        let err = RunPythonTool.call(json!({}), &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("missing 'code'"));
+    }
+
+    /// `run_python` timeout path: wall-clock cap fires and the tool
+    /// returns `status=timed_out`. Crucially this still proves the
+    /// blocking contract — the call does not return until the timeout
+    /// has elapsed and the subprocess has been killed.
+    #[tokio::test]
+    async fn run_python_tool_returns_timed_out_when_subprocess_exceeds_cap() {
+        use crate::db;
+        let mem = Memory::new(db::open_memory().await.unwrap());
+        let ctx = ToolCtx {
+            memory: mem,
+            run_id: "r-py".into(),
+            agent_name: "evolution".into(),
+        };
+        let started = std::time::Instant::now();
+        let out = RunPythonTool
+            .call(
+                json!({"code": "import time; time.sleep(10)", "timeout_s": 1}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(out["status"], "timed_out");
+        // Should return shortly after the 1s cap, not at the 10s natural
+        // sleep boundary. Allow generous slack for CI scheduling.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "run_python should respect timeout, took {elapsed:?}"
+        );
     }
 }

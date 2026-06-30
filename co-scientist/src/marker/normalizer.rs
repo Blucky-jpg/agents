@@ -65,7 +65,7 @@ pub struct ToolAlias {
 /// `record_hypothesis` and `record_review` are first-class tools (see
 /// `tool.rs::RecordHypothesisTool`, `RecordReviewTool`) and pass through
 /// unchanged — they are deliberately not in this table.
-const ALIASES: &[ToolAlias] = &[
+pub const ALIASES: &[ToolAlias] = &[
     ToolAlias {
         from: "record_system_feedback",
         to: "save_behavior",
@@ -157,8 +157,9 @@ pub fn normalize(raw_op: &str, payload: Value) -> Result<(String, Value)> {
 /// truncated. Public to allow testing the truncation rule in isolation.
 pub fn derive_summary(s: &str) -> String {
     let s = s.trim();
-    if s.len() > 200 {
-        format!("{}…", &s[..197])
+    if s.chars().count() > 200 {
+        let truncated: String = s.chars().take(197).collect();
+        format!("{truncated}…")
     } else {
         s.to_string()
     }
@@ -412,5 +413,18 @@ mod tests {
         let out = derive_summary(&s);
         assert!(out.ends_with('…'));
         assert!(out.chars().count() <= 200);
+    }
+
+    #[test]
+    fn derive_summary_long_with_multibyte_chars_truncates_on_char_boundary() {
+        // Regression: byte-slicing panicked when byte 197 fell inside a
+        // multi-byte UTF-8 char (em-dash, CJK, etc.). Truncate on char
+        // boundaries so any UTF-8 input is safe.
+        let s = "—".repeat(250); // 750 bytes, 250 chars — must trigger truncation
+        let out = derive_summary(&s);
+        assert!(out.ends_with('…'), "got: {out:?}");
+        assert!(out.chars().count() <= 200, "got {} chars", out.chars().count());
+        // Output must be valid UTF-8 — round-trip through bytes.
+        let _ = out.clone().into_bytes();
     }
 }

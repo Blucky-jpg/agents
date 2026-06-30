@@ -27,7 +27,7 @@ use crate::prompts::{AgentMode, Prompts, PromptContext};
 use crate::queue::{EnqueueRequest, TaskQueue};
 use crate::runner::{Runner, RunnerConfig};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
-use crate::tournament::TournamentRepo;
+use crate::tournament::matches::TournamentRepo;
 
 /// Per-session cache of [`Runner`] handles, keyed by `(session_id, agent_name)`.
 ///
@@ -957,6 +957,105 @@ pub static FOLLOW_UP_SPECS: &[FollowUpSpec] = &[
         next_mode: "reflection_on_result",
         priority: 130,
         requires_hypothesis: false,
+    },
+];
+
+/// One idle-injection edge in the DAG. Fired by the supervisor when
+/// the queue drains — the predicate decides whether the edge is
+/// eligible given current session state. The payload builder produces
+/// the `serde_json::Value` to enqueue.
+///
+/// This is the second half of the DAG that previously lived inline
+/// in `Supervisor::decide_next_steps` (a 110-line if-tree). Folding
+/// it into a data table makes "what runs when the queue is empty?"
+/// answerable by reading 4 rows.
+#[derive(Debug, Clone, Copy)]
+pub struct IdleSpec {
+    pub label: &'static str,
+    pub next_agent: &'static str,
+    pub next_mode: &'static str,
+    pub priority: i64,
+    /// Returns `Some(args)` if the edge should fire — `args` is the
+    /// extra payload fields beyond `(agent, mode, prompt, goal, preferences)`.
+    /// Returns `None` to skip.
+    pub predicate: fn(&IdleState) -> Option<serde_json::Value>,
+}
+
+/// Snapshot the idle predicates evaluate against. Built once per
+/// idle tick by the supervisor.
+#[derive(Debug, Clone)]
+pub struct IdleState {
+    pub session_id: String,
+    pub goal: String,
+    pub preferences: String,
+    pub total_hypotheses: i64,
+    pub mature_hypotheses: usize,
+    pub match_count: usize,
+    pub last_meta_review_at: usize,
+    pub meta_review_interval: usize,
+    pub min_hypotheses: usize,
+    pub min_mature: usize,
+    pub top_hypotheses_empty: bool,
+    pub hypothesis_needing_experiment: Option<i64>,
+}
+
+/// The idle-injection DAG. Rows in priority order (lower = earlier
+/// in the supervisor's tick).
+///
+/// Predicates return the extra payload fields needed for the task.
+/// `agent`, `mode`, `goal`, `preferences` are added by the supervisor
+/// before enqueue.
+pub static IDLE_SPECS: &[IdleSpec] = &[
+    IdleSpec {
+        label: "ranking/RunTournamentBatch",
+        next_agent: "ranking",
+        next_mode: "ranking_pairwise",
+        priority: 120,
+        predicate: |s| {
+            if s.total_hypotheses >= s.min_hypotheses as i64 {
+                Some(serde_json::json!({}))
+            } else {
+                None
+            }
+        },
+    },
+    IdleSpec {
+        label: "evolution/EvolveTopHypotheses",
+        next_agent: "evolution",
+        next_mode: "evolution_combine",
+        priority: 150,
+        predicate: |s| {
+            if s.mature_hypotheses >= s.min_mature && !s.top_hypotheses_empty {
+                Some(serde_json::json!({}))
+            } else {
+                None
+            }
+        },
+    },
+    IdleSpec {
+        label: "metareview/GenerateSystemFeedback",
+        next_agent: "metareview",
+        next_mode: "metareview_system",
+        priority: 180,
+        predicate: |s| {
+            if s.match_count > 0
+                && s.match_count - s.last_meta_review_at >= s.meta_review_interval
+            {
+                Some(serde_json::json!({}))
+            } else {
+                None
+            }
+        },
+    },
+    IdleSpec {
+        label: "experiment/DesignForHypothesis",
+        next_agent: "experiment",
+        next_mode: "experiment_design",
+        priority: 90, // below reflection/ranking so we don't crowd them out
+        predicate: |s| {
+            s.hypothesis_needing_experiment
+                .map(|hyp_id| serde_json::json!({ "hypothesis_id": hyp_id }))
+        },
     },
 ];
 

@@ -24,8 +24,8 @@ use crate::policies::{IdlePolicy, RunCounters, RunSnapshot, TerminationDecision,
 use crate::prompts::{AgentMode, Prompts, PromptContext};
 use crate::queue::{EnqueueRequest, TaskQueue};
 use crate::research_session::ResearchSessionRepo;
-use crate::runner::{Runner, RunnerConfig};
-use crate::tournament::TournamentRepo;
+use crate::run_agent::{IdleSpec, IdleState, SessionRunners, IDLE_SPECS};
+use crate::tournament::matches::TournamentRepo;
 
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
@@ -67,6 +67,11 @@ pub struct Supervisor {
     repo: ResearchSessionRepo,
     idle_policy: IdlePolicy,
     termination_policy: TerminationPolicy,
+    /// Per-session Runner cache. Shared with `RunAgentTool` when
+    /// `finalize()` runs the final metareview — keeps the supervisor
+    /// from spawning a second Claude subprocess for a role already
+    /// cached by the worker's run_agent dispatch.
+    session_runners: Arc<SessionRunners>,
     session_id: String,
     goal: String,
     preferences: String,
@@ -87,6 +92,7 @@ impl Supervisor {
         preferences: String,
         mut shutdown: watch::Receiver<bool>,
         shutdown_tx: watch::Sender<bool>,
+        session_runners: Arc<SessionRunners>,
     ) -> Result<()> {
         let repo = ResearchSessionRepo::new(memory.db_arc());
 
@@ -136,6 +142,7 @@ impl Supervisor {
             repo: repo.clone(),
             idle_policy: IdlePolicy::default(),
             termination_policy: TerminationPolicy::new(),
+            session_runners: session_runners.clone(),
             session_id: session_id.clone(),
             goal: goal.clone(),
             preferences: preferences.clone(),
@@ -279,120 +286,87 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Inject work when the queue drains. Returns tasks injected.
+    /// Inject work when the queue drains. Iterates [`IDLE_SPECS`] —
+    /// the idle half of the DAG — and enqueues any row whose
+    /// predicate fires. Folds the previous 110-line if-tree into a
+    /// single data-driven loop. Returns the number of tasks injected.
     async fn decide_next_steps(&self) -> Result<usize> {
+        let state = self.build_idle_state().await?;
+        let mut injected = 0usize;
+        for spec in IDLE_SPECS {
+            if let Some(extra) = (spec.predicate)(&state) {
+                self.enqueue_idle(spec, &state, extra).await?;
+                injected += 1;
+            }
+        }
+        Ok(injected)
+    }
+
+    /// Build the [`IdleState`] snapshot the [`IDLE_SPECS`] predicates
+    /// evaluate against. One DB roundtrip per dimension — total count,
+    /// mature count, top-N, match count, experimentable hypothesis.
+    /// Previously inlined into `decide_next_steps`.
+    async fn build_idle_state(&self) -> Result<IdleState> {
         let hyp_repo = HypothesisRepo::new(self.memory.db_arc());
         let tour_repo = TournamentRepo::new(self.memory.db_arc());
-        let mut injected = 0usize;
-
         let total = hyp_repo.total_count(&self.session_id).await?;
         let matches = tour_repo.match_count(&self.session_id).await? as usize;
-
-        // Tournament batch if enough hypotheses exist.
-        // RunAgentTool picks hypotheses and builds the pairwise prompt.
-        if total >= self.config.min_hypotheses as i64 {
-            let needs = hyp_repo.needs_matches(&self.session_id, 3, 10).await?;
-            if needs.len() >= 2 {
-                self.queue
-                    .enqueue(EnqueueRequest {
-                        session_id: self.session_id.clone(),
-                        agent: "ranking".into(),
-                        action: "run_agent".into(),
-                        payload: json!({
-                            "agent": "ranking",
-                            "mode": "ranking_pairwise",
-                            "prompt": "",
-                            "goal": self.goal,
-                            "preferences": self.preferences,
-                        }),
-                        priority: 120,
-                        max_attempts: 3,
-                    })
-                    .await?;
-                injected += 1;
-                info!("injected ranking/RunTournamentBatch");
-            }
-        }
-
-        // Evolution if enough mature hypotheses.
-        // RunAgentTool picks top hypotheses and builds the evolution prompt.
         let mature = hyp_repo.mature_count(&self.session_id, 3).await? as usize;
-        if mature >= self.config.min_mature {
-            let top = hyp_repo.top_n(&self.session_id, 5).await?;
-            if !top.is_empty() {
-                self.queue
-                    .enqueue(EnqueueRequest {
-                        session_id: self.session_id.clone(),
-                        agent: "evolution".into(),
-                        action: "run_agent".into(),
-                        payload: json!({
-                            "agent": "evolution",
-                            "mode": "evolution_combine",
-                            "prompt": "",
-                            "goal": self.goal,
-                            "preferences": self.preferences,
-                        }),
-                        priority: 150,
-                        max_attempts: 3,
-                    })
-                    .await?;
-                injected += 1;
-                info!("injected evolution/EvolveTopHypotheses");
+        let top = hyp_repo.top_n(&self.session_id, 5).await?;
+        let hypothesis_needing_experiment = self
+            .pick_hypothesis_needing_experiment()
+            .await?
+            .and_then(|(hyp_id, _)| Some(hyp_id));
+        Ok(IdleState {
+            session_id: self.session_id.clone(),
+            goal: self.goal.clone(),
+            preferences: self.preferences.clone(),
+            total_hypotheses: total,
+            mature_hypotheses: mature,
+            match_count: matches,
+            last_meta_review_at: self.last_meta_review_at,
+            meta_review_interval: self.config.meta_review_interval,
+            min_hypotheses: self.config.min_hypotheses,
+            min_mature: self.config.min_mature,
+            top_hypotheses_empty: top.is_empty(),
+            hypothesis_needing_experiment,
+        })
+    }
+
+    /// Enqueue one row from [`IDLE_SPECS`]. The standard
+    /// `(agent, mode, prompt, goal, preferences)` fields are added by
+    /// the supervisor; the spec's `predicate` returned the extra
+    /// payload fields (e.g. `hypothesis_id` for experiment_design).
+    async fn enqueue_idle(
+        &self,
+        spec: &IdleSpec,
+        state: &IdleState,
+        extra: serde_json::Value,
+    ) -> Result<()> {
+        let mut payload = json!({
+            "agent": spec.next_agent,
+            "mode": spec.next_mode,
+            "prompt": "",
+            "goal": state.goal,
+            "preferences": state.preferences,
+        });
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                payload[k] = v.clone();
             }
         }
-
-        // Periodic meta-review.
-        // RunAgentTool builds the prompt from recent tournament rationales.
-        if matches > 0 && matches - self.last_meta_review_at >= self.config.meta_review_interval {
-            self.queue
-                .enqueue(EnqueueRequest {
-                    session_id: self.session_id.clone(),
-                    agent: "metareview".into(),
-                    action: "run_agent".into(),
-                    payload: json!({
-                        "agent": "metareview",
-                        "mode": "metareview_system",
-                        "prompt": "",
-                        "goal": self.goal,
-                        "preferences": self.preferences,
-                    }),
-                    priority: 180,
-                    max_attempts: 3,
-                })
-                .await?;
-            injected += 1;
-            info!("injected metareview/GenerateSystemFeedback");
-        }
-
-        // Experimental-loop injection. For each reviewed hypothesis
-        // that has no experiment yet, enqueue an experiment_design
-        // task. The 3-stage chain (design→execute→evaluate→reflect)
-        // is wired in `run_agent::enqueue_follow_ups`. Capped to one
-        // new design per idle tick so a flood of newly-reviewed
-        // hypotheses doesn't starve other work.
-        if let Ok(Some((hyp_id, _))) = self.pick_hypothesis_needing_experiment().await {
-            self.queue
-                .enqueue(EnqueueRequest {
-                    session_id: self.session_id.clone(),
-                    agent: "experiment".into(),
-                    action: "run_agent".into(),
-                    payload: json!({
-                        "agent": "experiment",
-                        "mode": "experiment_design",
-                        "prompt": "",
-                        "hypothesis_id": hyp_id,
-                        "goal": self.goal,
-                        "preferences": self.preferences,
-                    }),
-                    priority: 90, // below reflection/ranking so we don't crowd them out
-                    max_attempts: 3,
-                })
-                .await?;
-            injected += 1;
-            info!(hyp_id, "injected experiment/DesignForHypothesis");
-        }
-
-        Ok(injected)
+        self.queue
+            .enqueue(EnqueueRequest {
+                session_id: self.session_id.clone(),
+                agent: spec.next_agent.to_string(),
+                action: "run_agent".to_string(),
+                payload,
+                priority: spec.priority,
+                max_attempts: 3,
+            })
+            .await?;
+        info!("injected {}", spec.label);
+        Ok(())
     }
 
     /// Pick a hypothesis that has been reviewed at least once but
@@ -496,7 +470,9 @@ impl Supervisor {
         // Cancel before running metareview — but cancel again after, in
         // case a follow-up task enqueued itself between our cancel and
         // the metareview call.
-        self.queue.cancel_pending(&self.session_id).await.ok();
+        if let Err(e) = self.queue.cancel_pending(&self.session_id).await {
+            tracing::warn!(error = %e, "cancel_pending failed during finalize");
+        }
 
         let hyp_repo = HypothesisRepo::new(self.memory.db_arc());
         let top = hyp_repo.top_n(&self.session_id, 10).await?;
@@ -530,13 +506,21 @@ impl Supervisor {
         ctx.set("top_hypotheses_block", &top_block);
         let rendered = self.prompts.render(AgentMode::MetaReviewFinal, &ctx)?;
 
+        // Reuse the per-session Runner cache so we don't spawn a
+        // second Claude subprocess for the metareview role. The cache
+        // is shared with `RunAgentTool`; if a metareview has already
+        // run during the session (idle injection), the cached Runner
+        // is reused. On a cache miss we build a fresh Runner with the
+        // same registry — same path `RunAgentTool` takes.
         let agent = AGENTS.iter().find(|a| a.name == "metareview").unwrap();
-        let mut runner = Runner::with_registry(
+        let runner_arc = self.session_runners.get_or_build(
+            &self.session_id,
+            agent.name,
             self.memory.clone(),
             self.registry.clone(),
-            &self.session_id,
-            RunnerConfig::default(),
+            crate::runner::RunnerConfig::default(),
         );
+        let mut runner = runner_arc.lock().await;
         match runner.turn(agent, &rendered).await {
             Ok(outcome) => {
                 let report = outcome.cleaned_text;
@@ -547,7 +531,9 @@ impl Supervisor {
                         &chrono::Utc::now().to_rfc3339(),
                     )
                     .await?;
-                std::fs::write("report.md", &report).ok();
+                if let Err(e) = std::fs::write("report.md", &report) {
+                    tracing::warn!(error = %e, "failed to write report.md; DB copy is still authoritative");
+                }
                 info!("final report written to report.md");
             }
             Err(e) => {

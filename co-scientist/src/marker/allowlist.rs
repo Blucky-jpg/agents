@@ -27,47 +27,19 @@
 use crate::marker_normalizer::canonicalize;
 use crate::prompts::{AgentMode, AgentMode::*, PROMPT_MODES};
 use crate::registry::default_allowlist;
+use crate::tool_catalog;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeSet, HashMap};
 
-/// Every name the LLM might emit as a marker, derived from the
-/// union of: registered first-class tools, community aliases in
-/// `marker_normalizer`, plus the synthetic sentinels. Used by
-/// [`extract_tool_refs`] to also pick up backtick-quoted tool
-/// references in prompt prose ("Call `record_research_plan`...").
+/// Every name the LLM might emit as a marker. Derived from
+/// [`crate::tool_catalog::TOOL_CATALOG`] (canonical names + aliases).
+/// This is the single source of truth for "what tokens in backtick
+/// spans could be tool references?" — used by [`extract_backtick_refs`]
+/// to scan prompt prose.
 fn known_tool_names() -> &'static BTreeSet<&'static str> {
     use std::sync::OnceLock;
     static NAMES: OnceLock<BTreeSet<&'static str>> = OnceLock::new();
-    NAMES.get_or_init(|| {
-        let mut s: BTreeSet<&'static str> = BTreeSet::new();
-        // Registered first-class tools (matches `builtin_tools`).
-        for n in [
-            "save_semantic",
-            "save_behavior",
-            "get_context",
-            "compress_events",
-            "peek_context",
-            "get_timeline",
-            "get_observation",
-            "archive_observation",
-            "delete_observation",
-            "record_hypothesis",
-            "record_review",
-            "record_tournament_match",
-            "design_experiment",
-            "execute_experiment",
-            "evaluate_result",
-            "noop",
-            "none",
-        ] {
-            s.insert(n);
-        }
-        // Community aliases (matches `marker_normalizer::ALIASES`).
-        for n in ["record_research_plan", "record_system_feedback"] {
-            s.insert(n);
-        }
-        s
-    })
+    NAMES.get_or_init(|| tool_catalog::known_tool_names().iter().copied().collect())
 }
 
 /// One mode's tool references, extracted from its prompt template.
@@ -100,7 +72,21 @@ impl PromptToolTable {
     /// before the registered-tool lookup (see the `noop` / `none`
     /// branch in `registry::dispatch`), so the validator must treat
     /// them as universal — they are not registered as Tools.
-    const ALWAYS_ALLOWED: &'static [&'static str] = &["noop", "none"];
+    ///
+    /// Derived from `tool_catalog::TOOL_CATALOG` so the source of truth
+    /// is one place. Computed once via `OnceLock` since the catalog is
+    /// a const slice.
+    fn always_allowed() -> &'static [&'static str] {
+        use std::sync::OnceLock;
+        static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+        NAMES.get_or_init(|| {
+            crate::tool_catalog::TOOL_CATALOG
+                .iter()
+                .filter(|e| e.always_allowed)
+                .map(|e| e.name)
+                .collect()
+        })
+    }
 
     /// Build the table from the 18 embedded prompt templates. Runs
     /// the static parse; if any template has unparseable marker syntax
@@ -110,24 +96,24 @@ impl PromptToolTable {
         let mut by_mode = HashMap::new();
         for mode in PROMPT_MODES {
             let body: &str = match mode {
-                ParseGoal => include_str!("../prompts/parse_goal.md"),
-                GenerationLiterature => include_str!("../prompts/generation_literature.md"),
-                GenerationDebate => include_str!("../prompts/generation_debate.md"),
-                ReflectionReview => include_str!("../prompts/reflection_review.md"),
-                ReflectionObservation => include_str!("../prompts/reflection_observation.md"),
-                ReflectionVerification => include_str!("../prompts/reflection_verification.md"),
-                ReflectionOnResult => include_str!("../prompts/reflection_on_result.md"),
-                RankingPairwise => include_str!("../prompts/ranking_pairwise.md"),
-                RankingDebate => include_str!("../prompts/ranking_debate.md"),
-                EvolutionCombine => include_str!("../prompts/evolution_combine.md"),
-                EvolutionSimplify => include_str!("../prompts/evolution_simplify.md"),
-                EvolutionFeasibility => include_str!("../prompts/evolution_feasibility.md"),
-                EvolutionOutOfBox => include_str!("../prompts/evolution_out_of_box.md"),
-                MetaReviewSystem => include_str!("../prompts/metareview_system.md"),
-                MetaReviewFinal => include_str!("../prompts/metareview_final.md"),
-                ExperimentDesign => include_str!("../prompts/experiment_design.md"),
-                ExperimentExecute => include_str!("../prompts/experiment_execute.md"),
-                ExperimentEvaluate => include_str!("../prompts/experiment_evaluate.md"),
+                ParseGoal => include_str!("../../prompts/parse_goal.md"),
+                GenerationLiterature => include_str!("../../prompts/generation_literature.md"),
+                GenerationDebate => include_str!("../../prompts/generation_debate.md"),
+                ReflectionReview => include_str!("../../prompts/reflection_review.md"),
+                ReflectionObservation => include_str!("../../prompts/reflection_observation.md"),
+                ReflectionVerification => include_str!("../../prompts/reflection_verification.md"),
+                ReflectionOnResult => include_str!("../../prompts/reflection_on_result.md"),
+                RankingPairwise => include_str!("../../prompts/ranking_pairwise.md"),
+                RankingDebate => include_str!("../../prompts/ranking_debate.md"),
+                EvolutionCombine => include_str!("../../prompts/evolution_combine.md"),
+                EvolutionSimplify => include_str!("../../prompts/evolution_simplify.md"),
+                EvolutionFeasibility => include_str!("../../prompts/evolution_feasibility.md"),
+                EvolutionOutOfBox => include_str!("../../prompts/evolution_out_of_box.md"),
+                MetaReviewSystem => include_str!("../../prompts/metareview_system.md"),
+                MetaReviewFinal => include_str!("../../prompts/metareview_final.md"),
+                ExperimentDesign => include_str!("../../prompts/experiment_design.md"),
+                ExperimentExecute => include_str!("../../prompts/experiment_execute.md"),
+                ExperimentEvaluate => include_str!("../../prompts/experiment_evaluate.md"),
             };
             let tools = extract_tool_refs(body)
                 .with_context(|| format!("parsing {}", mode.filename()))?;
@@ -162,7 +148,7 @@ impl PromptToolTable {
             let allow_set: BTreeSet<&str> = allow.iter().copied().collect();
             let referenced = self.tools_for(*mode);
             for tool in referenced {
-                if Self::ALWAYS_ALLOWED.contains(&tool.as_str()) {
+                if Self::always_allowed().contains(&tool.as_str()) {
                     continue;
                 }
                 if !allow_set.contains(tool.as_str())
@@ -202,7 +188,7 @@ impl PromptToolTable {
             .ok_or_else(|| anyhow!("agent `{agent_name}` has no default_allowlist entry"))?;
         let allow_set: BTreeSet<&str> = allow.iter().copied().collect();
         for tool in self.tools_for(mode) {
-            if Self::ALWAYS_ALLOWED.contains(&tool.as_str()) {
+            if Self::always_allowed().contains(&tool.as_str()) {
                 continue;
             }
             if !allow_set.contains(tool.as_str())

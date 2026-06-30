@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The full skill document, embedded at compile time from `SKILL.md`.
-pub const SKILL: &str = include_str!("../SKILL.md");
+pub const SKILL: &str = include_str!("../../SKILL.md");
 
 /// One parsed memory operation emitted by the model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

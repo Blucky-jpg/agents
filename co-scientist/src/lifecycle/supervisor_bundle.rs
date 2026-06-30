@@ -18,33 +18,33 @@
 //! 6. Run the supervisor (blocking) on the same bus + shutdown channel.
 //! 7. On return, signal shutdown to the background tasks and join them.
 //!
-//! The TUI's `run_supervisor_inner` (formerly in `co-scientist-tui/src/main.rs`)
-//! and the CLI's `cmd_start` (`co-scientist/src/main.rs`) did exactly this.
-//! Two adapters, one shared shape — a real seam with a real seam name. This
-//! module is the seam name.
+//! The CLI's `cmd_start` (`co-scientist/src/main.rs`) wires this up.
+//! The shape is reusable: any future consumer that needs the full
+//! supervisor + consolidation + worker stack adopts the same wiring.
+//! This module is the seam.
 //!
 //! ## What this module is *not*
 //!
 //! - It is not a `Subscriber` trait. We considered a `Subscriber`-shaped
 //!   abstraction so the bus forwarder could be polymorphic, but the only
-//!   two real consumers (`mpsc::UnboundedSender<MemoryEvent>` and
-//!   `mpsc::UnboundedSender<AgentToUi::SupervisorEvent>`) share the same
-//!   shape already. A trait would be one adapter, which the codebase-design
-//!   vocabulary flags as a hypothetical seam. If a third consumer ever
-//!   needs different forwarding, that's the moment to introduce the trait.
+//!   real consumer is `mpsc::UnboundedSender<MemoryEvent>` — the CLI uses
+//!   it directly via `spawn_bus_forwarder`. A trait would wrap one adapter,
+//!   which the codebase-design vocabulary flags as a hypothetical seam.
+//!   If a second consumer ever needs different forwarding, that's the
+//!   moment to introduce the trait.
 //! - It does not modify `Supervisor`, `Worker`, or `ConsolidationService`.
 //!   The 28 pre-existing clippy warnings in `supervisor.rs` and `runner.rs`
-//!   are out of scope for TUI redesign work (D5 in project memory). This
+//!   are out of scope. This
 //!   module is a *new* file and is clippy-clean by construction.
 //!
-//! ## Two-adapter seam (justification)
+//! ## Single-adapter seam (justification)
 //!
 //! The deletion test: would deleting this module and inlining the wiring
-//! back into the two callers reduce complexity? No — it would concentrate
-//! the same ~80 lines of plumbing in two places, and the two copies would
-//! drift (the TUI's bus forwarder would diverge from the CLI's stdout
-//! subscriber, the shutdown bridge would diverge, etc.). The module
-//! *concentrates* the wiring, so it earns its place.
+//! back into the caller reduce complexity? No — it would concentrate
+//! ~80 lines of plumbing at the CLI call site, and any future consumer
+//! adopting the same pattern would drift (the bus forwarder would diverge,
+//! the shutdown bridge would diverge, etc.). The module *concentrates*
+//! the wiring, so it earns its place.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,14 +53,14 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::bus::{EventBus, MemoryEvent};
+use crate::bus::{run_failure_aggregator, EventBus, FailureAggregatorConfig, MemoryEvent};
 use crate::db::Db;
 use crate::memory::Memory;
 use crate::prompts::Prompts;
 use crate::promotion::{ConsolidationService, PromotionConfig};
 use crate::queue::TaskQueue;
 use crate::registry::ToolRegistry;
-use crate::run_agent::RunAgentTool;
+use crate::run_agent::{RunAgentTool, SessionRunners};
 use crate::runner::RunnerConfig;
 use crate::supervisor::{Supervisor, SupervisorConfig};
 use crate::tool::builtin_tools;
@@ -96,9 +96,8 @@ pub struct Config {
 /// the bundle's `external_stop` parameter would *race* with the
 /// bundle's internal pair — two tokio tasks listening for SIGINT.
 /// Both fire, both forward, all correct, but wasteful and confusing.
-/// The new design trusts the caller to own SIGINT handling. The TUI's
-/// `supervisor_session::start` and the CLI's `cmd_start` both build
-/// the pair the same way; the bundle sees a single receiver.
+/// The new design trusts the caller to own SIGINT handling. The CLI's
+/// `cmd_start` builds the pair directly; the bundle sees a single receiver.
 ///
 /// ## Event bus
 ///
@@ -106,8 +105,8 @@ pub struct Config {
 /// deliberate: it lets the caller subscribe to the same bus the
 /// supervisor / worker / consolidation publish to, so live telemetry
 /// (task progress, memory writes) reaches the front-end without the
-/// bundle needing a generic `Subscriber` trait. The TUI uses this to
-/// forward `MemoryEvent → AgentToUi::SupervisorEvent` via
+/// bundle needing a generic `Subscriber` trait. The CLI uses this to
+/// stream live `MemoryEvent`s without polling SQLite via
 /// [`spawn_bus_forwarder`].
 pub async fn run(
     db_path: PathBuf,
@@ -143,7 +142,13 @@ pub async fn run(
     let q = TaskQueue::new(Db::new(Db::connect_fresh(db_path.to_str().unwrap()).await?));
 
     let prompts = Arc::new(Prompts::new()?);
-    let reg = build_registry(&q, &prompts, &cfg.runner)?;
+    // One SessionRunners cache, shared between RunAgentTool (the
+    // worker dispatch path) and Supervisor::finalize (the final
+    // metareview). The supervisor's metareview reuses the cached
+    // Runner so it doesn't spawn a second Claude subprocess for a
+    // role already cached by an earlier idle-injection dispatch.
+    let session_runners = Arc::new(SessionRunners::new());
+    let reg = build_registry(&q, &prompts, &cfg.runner, &session_runners)?;
     let reg = Arc::new(reg);
 
     // The bundle does not own SIGINT — see the doc comment above for
@@ -176,6 +181,19 @@ pub async fn run(
         }
     });
 
+    // Failure aggregator: subscribes to MemoryEvent::MarkerFailed on the
+    // bus and republishes a periodic MemoryEvent::FailureStats. Without
+    // this, MarkerFailed events published by Runner::dispatch_marker
+    // have no consumer — the broadcast channel is created but no one
+    // ever listens, so per-agent failure modes are invisible at runtime.
+    let aggregator_handle = tokio::spawn({
+        let shutdown = shutdown_rx.clone();
+        let bus = event_bus.clone();
+        async move {
+            run_failure_aggregator(bus, FailureAggregatorConfig::default(), shutdown).await;
+        }
+    });
+
     let worker_handle = tokio::spawn({
         let shutdown = shutdown_rx.clone();
         let q = q.clone();
@@ -200,6 +218,7 @@ pub async fn run(
         preferences,
         shutdown_rx.clone(),
         shutdown_tx.clone(),
+        session_runners.clone(),
     )
     .await;
 
@@ -209,6 +228,7 @@ pub async fn run(
     let _ = shutdown_tx.send(true);
     let _ = worker_handle.await;
     let _ = consolidation_handle.await;
+    let _ = aggregator_handle.await;
 
     Ok(BundleOutcome {
         supervisor: supervisor_result,
@@ -232,6 +252,7 @@ fn build_registry(
     queue: &TaskQueue,
     prompts: &Arc<Prompts>,
     runner_cfg: &RunnerConfig,
+    session_runners: &Arc<SessionRunners>,
 ) -> Result<ToolRegistry> {
     let mut reg = ToolRegistry::new();
     reg.register_all(builtin_tools());
@@ -246,11 +267,15 @@ fn build_registry(
         }
     }
 
-    let run_agent_tool = RunAgentTool::new(
+    // `RunAgentTool` shares `session_runners` with the supervisor so
+    // `Supervisor::finalize` can reuse the cached Runner for the
+    // metareview role.
+    let run_agent_tool = RunAgentTool::with_session_runners(
         queue.clone(),
         prompts.clone(),
         Arc::new(reg.clone()),
         runner_cfg.clone(),
+        session_runners.clone(),
     );
     reg.register(Arc::new(run_agent_tool));
 
@@ -258,10 +283,8 @@ fn build_registry(
 }
 
 /// Drain `event_bus` and forward each `MemoryEvent` to the caller-supplied
-/// `tx`. The TUI calls this with a closure that maps `MemoryEvent →
-/// AgentToUi::SupervisorEvent` (one adapter); the CLI can call it with
-/// a passthrough or `tracing`-emitting closure (the second adapter — the
-/// seam earns its keep).
+/// `tx`. The CLI calls this with a passthrough or `tracing`-emitting
+/// closure that observes live `MemoryEvent`s without polling SQLite.
 ///
 /// `RecvError::Lagged` is handled by skipping the gap silently, matching
 /// the pre-extraction behavior in `run_supervisor_inner`. Drop the returned

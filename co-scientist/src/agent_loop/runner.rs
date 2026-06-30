@@ -153,7 +153,14 @@ pub struct Runner {
     /// run. Eliminates 3–4 redundant DB hits per turn on long
     /// sessions. Replaces the previous "every turn refetches everything"
     /// path.
-    prompt_cache: PromptContextCache,
+    ///
+    /// Wrapped in `Arc` so the bus drain task can call `invalidate()`
+    /// concurrently with the Runner's reads/writes.
+    prompt_cache: Arc<PromptContextCache>,
+    /// Join handle for the bus drain task. Kept so we can cancel it
+    /// on Runner drop (future) — for now the task exits when the
+    /// bus closes, which happens at process shutdown.
+    _cache_drain: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct ClaudeHandle {
@@ -172,21 +179,79 @@ struct CachedPromptBlocks {
 }
 
 /// Prompt-context cache. Single-writer (the Runner), single-reader
-/// (the Runner). Backed by a `Mutex` because the cache mutation and
-/// the bus subscription both need exclusive access to keep the
-/// `cached_step` field consistent with the cached values.
-#[derive(Debug, Default)]
+/// (the Runner). The bus drain task invalidates via [`Arc::Self`].
+#[derive(Debug)]
 pub struct PromptContextCache {
     inner: std::sync::Mutex<Option<CachedPromptBlocks>>,
-    /// Optional bus subscription. Created lazily on first cache miss
-    /// because we need to know the agent/run_id to subscribe usefully.
-    /// Stored as `None` until the cache is populated once.
-    _subscriber: Option<()>,
+    /// Held only so the broadcast::Receiver isn't dropped — the
+    /// drain task itself runs in a `tokio::spawn` and carries its own
+    /// receiver clone.
+    _subscriber_keepalive: Option<tokio::sync::broadcast::Receiver<crate::bus::MemoryEvent>>,
+}
+
+impl Default for PromptContextCache {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(None),
+            _subscriber_keepalive: None,
+        }
+    }
 }
 
 impl PromptContextCache {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the bus subscription. Called from the Runner after the
+    /// memory handle is available. Spawns a drain task that
+    /// invalidates the cache on any `SemanticSaved` (matched on
+    /// `run_id`) or `BehaviorSaved` (unconditional — bus doesn't
+    /// carry run_id on that variant) event. Returns the join handle
+    /// for tests that want to await the drain.
+    ///
+    /// This is what the doc-comment on `prompt_cache` (in the Runner
+    /// struct) has always promised — but previously the field was
+    /// `Option<()>` and never instantiated. Writes from
+    /// `consolidation::cluster_and_archive`, `experiment_evaluate`,
+    /// and other non-dispatch paths now correctly invalidate.
+    fn attach_bus(
+        self: &Arc<Self>,
+        bus: crate::bus::EventBus,
+        run_id: String,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut rx = bus.subscribe();
+        let cache = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(crate::bus::MemoryEvent::SemanticSaved {
+                        run_id: ev_run, ..
+                    }) => {
+                        // Filter on run_id so a sibling session's
+                        // saves don't invalidate our cache.
+                        if ev_run == run_id {
+                            cache.invalidate();
+                        }
+                    }
+                    // BehaviorSaved doesn't carry run_id — but
+                    // BehaviorSaved events are rare and the prior
+                    // behavior block is global to the agent; be
+                    // conservative and invalidate unconditionally.
+                    Ok(crate::bus::MemoryEvent::BehaviorSaved { .. }) => {
+                        cache.invalidate();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Lagged: we may have missed events. Be safe
+                        // and invalidate — a redundant miss is much
+                        // cheaper than a stale hit.
+                        cache.invalidate();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {}
+                }
+            }
+        })
     }
 
     /// Get the cached blocks if they're fresh for `step_index`. A
@@ -206,9 +271,11 @@ impl PromptContextCache {
         *guard = Some(blocks);
     }
 
-    /// Invalidate any cached entry. Called from the bus subscriber
+    /// Invalidate any cached entry. Called from the bus drain task
     /// when a new memory row is written that could change the
-    /// retrieved set.
+    /// retrieved set, and from the dispatch path after a successful
+    /// marker dispatch (the latter is now redundant with the bus
+    /// subscription, but kept as a fast-path to avoid one bus hop).
     fn invalidate(&self) {
         let mut guard = self.inner.lock().expect("prompt_cache poisoned");
         *guard = None;
@@ -242,17 +309,22 @@ impl Runner {
         if prompts.is_none() {
             tracing::warn!("community prompts failed to load; runner will use role-only system prompts");
         }
+        let prompt_cache = Arc::new(PromptContextCache::new());
+        let bus = memory.bus().clone();
+        let run_id_for_drain = run_id.into();
+        let cache_drain = prompt_cache.attach_bus(bus, run_id_for_drain.clone());
         let mut me = Self {
             memory,
             registry: Arc::new(reg),
             prompts,
-            run_id: run_id.into(),
+            run_id: run_id_for_drain,
             config,
             skill_cache: std::sync::Mutex::new(None),
             turns_completed: 0,
             claude: None,
             step_index: 0,
-            prompt_cache: PromptContextCache::new(),
+            prompt_cache,
+            _cache_drain: Some(cache_drain),
         };
         if let Some(dir) = &me.config.skills_dir {
             me.set_skills_dir(dir.clone());
@@ -269,18 +341,29 @@ impl Runner {
         run_id: impl Into<String>,
         config: RunnerConfig,
     ) -> Self {
-        let prompts = Prompts::new().ok().map(Arc::new);
+        let prompts = match Prompts::new() {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                tracing::warn!(error = %e, "community prompts failed to load; runner will use role-only system prompts");
+                None
+            }
+        };
+        let prompt_cache = Arc::new(PromptContextCache::new());
+        let bus = memory.bus().clone();
+        let run_id_for_drain = run_id.into();
+        let cache_drain = prompt_cache.attach_bus(bus, run_id_for_drain.clone());
         let mut me = Self {
             memory,
             registry,
             prompts,
-            run_id: run_id.into(),
+            run_id: run_id_for_drain,
             config,
             skill_cache: std::sync::Mutex::new(None),
             turns_completed: 0,
             claude: None,
             step_index: 0,
-            prompt_cache: PromptContextCache::new(),
+            prompt_cache,
+            _cache_drain: Some(cache_drain),
         };
         if let Some(dir) = &me.config.skills_dir {
             me.set_skills_dir(dir.clone());
@@ -617,8 +700,8 @@ impl Runner {
     ///
     /// `delta_tx` is a `mpsc::UnboundedSender<String>` — `Send + 'static`
     /// so it can be moved across the `.await` calls inside the runner.
-    /// The TUI subscribes to the corresponding receiver and appends each
-    /// delta to the chat log live.
+    /// Subscribers receive the corresponding events on the unbounded
+    /// receiver and append each delta live.
     ///
     /// Behaviour matches `turn` for everything except text delivery: same
     /// prompt prep, same connect-on-demand, same retry policy, same
@@ -1003,7 +1086,7 @@ pub async fn dispatch_marker(
                 op: raw_name.clone(),
                 error: e.to_string(),
             });
-            memory
+            let audit = memory
                 .log_event(
                     run_id,
                     agent.name,
@@ -1016,8 +1099,14 @@ pub async fn dispatch_marker(
                         "payload_keys": payload_keys,
                     })),
                 )
-                .await
-                .ok();
+                .await;
+            if let Err(audit_err) = audit {
+                tracing::warn!(
+                    op = %raw_name,
+                    error = %audit_err,
+                    "audit log of memory_op_failed failed; MarkerFailed event still published"
+                );
+            }
             Err(e)
         }
     }
@@ -1990,5 +2079,125 @@ mod tests {
             run_id: "r".into(),
             agent_name: "supervisor".into(),
         };
+    }
+
+    /// End-to-end: a `run_python` marker dispatched through the registry
+    /// runs the subprocess, returns the result, and writes the audit
+    /// `python_executed` event. This is the same path the LLM takes:
+    /// `parse_markers → dispatch_marker → registry.dispatch →
+    /// RunPythonTool.call → run_python_code`. The call is synchronous-
+    /// blocking; the future resolves only after the subprocess exits.
+    #[tokio::test]
+    async fn dispatch_marker_run_python_executes_subprocess_and_logs_audit() {
+        use crate::registry::ToolRegistry;
+        use crate::tool::builtin_tools;
+        let mem = Memory::new(db::open_memory().await.unwrap());
+        let mut reg = ToolRegistry::new();
+        reg.register_all(builtin_tools());
+        let marker = crate::skill::Marker {
+            op: "run_python".into(),
+            payload: serde_json::json!({"code": "print(7 * 6)"}),
+        };
+        dispatch_marker(
+            &mem, mem.bus(), &reg, "r-py-e2e",
+            AGENTS.iter().find(|a| a.name == "generation").unwrap(),
+            &marker, 0,
+        )
+        .await
+        .expect("dispatch ok");
+
+        // Audit event should be written by the tool's log_event call.
+        let py_count = mem
+            .conn()
+            .query(
+                "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND type = 'python_executed'",
+                ["r-py-e2e"],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .map(|r| r.get::<i64>(0).unwrap())
+            .unwrap_or(0);
+        assert_eq!(py_count, 1, "exactly one python_executed event row");
+    }
+
+    /// The prompt cache must invalidate on a `SemanticSaved` event
+    /// even when the write did not flow through `dispatch_marker`.
+    /// Previously the doc-comment promised this, but the bus
+    /// subscription was never instantiated — only the dispatcher's
+    /// own success path invalidated. This test pins the new contract:
+    /// the consolidation service (or any other producer) publishes
+    /// `SemanticSaved`, and the cache entry vanishes.
+    #[tokio::test]
+    async fn prompt_cache_invalidates_on_external_semantic_saved() {
+        let mem = Memory::new(db::open_memory().await.unwrap());
+        let cache = Arc::new(PromptContextCache::new());
+        let bus = mem.bus().clone();
+        let _drain = cache.attach_bus(bus.clone(), "external-run".to_string());
+
+        // Populate the cache.
+        cache.put(CachedPromptBlocks {
+            prior_behavior: vec![],
+            prior_session: "old".into(),
+            marker_errors: vec![],
+            step_index: 0,
+        });
+        assert_eq!(cache._len(), 1, "cache populated");
+
+        // Publish from "outside" — no dispatch_marker involved.
+        // The run_id matches; this should invalidate.
+        bus.publish(crate::bus::MemoryEvent::SemanticSaved {
+            id: 1,
+            run_id: "external-run".into(),
+            scope: "experiment".into(),
+            summary: "from consolidation".into(),
+        });
+        // Give the drain task a moment to receive.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(cache._len(), 0, "cache must invalidate on SemanticSaved");
+    }
+
+    /// A `SemanticSaved` from a *different* run must NOT invalidate
+    /// this cache. The drain task filters on `run_id`.
+    #[tokio::test]
+    async fn prompt_cache_ignores_semantic_saved_from_other_run() {
+        let mem = Memory::new(db::open_memory().await.unwrap());
+        let cache = Arc::new(PromptContextCache::new());
+        let bus = mem.bus().clone();
+        let _drain = cache.attach_bus(bus.clone(), "this-run".to_string());
+
+        cache.put(CachedPromptBlocks {
+            prior_behavior: vec![],
+            prior_session: "old".into(),
+            marker_errors: vec![],
+            step_index: 0,
+        });
+        assert_eq!(cache._len(), 1);
+
+        // Different run_id — should be ignored.
+        bus.publish(crate::bus::MemoryEvent::SemanticSaved {
+            id: 1,
+            run_id: "other-run".into(),
+            scope: "experiment".into(),
+            summary: "not mine".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            cache._len(),
+            1,
+            "cache must NOT invalidate on other-run SemanticSaved"
+        );
+
+        // Same run_id — should invalidate.
+        bus.publish(crate::bus::MemoryEvent::SemanticSaved {
+            id: 2,
+            run_id: "this-run".into(),
+            scope: "experiment".into(),
+            summary: "mine".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(cache._len(), 0, "cache must invalidate on this-run SemanticSaved");
     }
 }

@@ -10,7 +10,8 @@
 //! Design choices per IMPROVEMENT_PLAN §experiment-2026-06-28:
 //!
 //! - **Permissive sandbox**: spawn `python3 -c` in a tempdir, 30s wall
-//!   clock, RLIMIT_AS capped at 256MB. Runs as the user. Acceptable
+//!   clock, RLIMIT_AS advertised at 1.5GB (currently advisory only —
+//!   see the inline note below). Runs as the user. Acceptable
 //!   for single-user local research; not safe for hostile multi-tenant.
 //! - **Timeout enforcement**: `tokio::time::timeout` cancels the await
 //!   but does NOT kill the child. We additionally `child.kill()` after

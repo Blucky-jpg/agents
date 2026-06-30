@@ -30,9 +30,12 @@ mod experiment;
 mod memory;
 mod research;
 
+pub mod registry;
+
 pub use curation::*;
 pub use experiment::*;
 pub use memory::*;
+pub use registry::*;
 pub use research::*;
 
 /// Per-call context passed to a tool. Carries the memory handle, run id,
@@ -70,7 +73,11 @@ pub trait Tool: Send + Sync {
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput>;
 }
 
-/// The standard set of memory tools, ready to register.
+/// The standard set of memory tools, ready to register. Driven from
+/// [`crate::tool_catalog::TOOL_CATALOG`] — every row with
+/// `always_allowed == false` and an Arc impl below is registered.
+/// The catalog test in `tool_catalog.rs` pins the reverse direction:
+/// every catalog row has a registered impl.
 pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(SaveSemanticTool),
@@ -85,11 +92,44 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(RecordHypothesisTool),
         Arc::new(RecordReviewTool),
         Arc::new(RecordTournamentMatchTool),
-        // Empirical-loop tools (see src/experiment.rs).
+        // Empirical-loop tools (see src/research/experiment.rs).
         Arc::new(DesignExperimentTool),
         Arc::new(ExecuteExperimentTool),
         Arc::new(EvaluateResultTool),
+        // Inline Python execution: synchronous-blocking `run_python`.
+        Arc::new(RunPythonTool),
     ]
+}
+
+/// Assert that every catalog row whose `always_allowed == false` has
+/// a corresponding `Tool::name()` in `builtin_tools()`. Called from
+/// the test module below; if a catalog row is added without an impl,
+/// the test fails loud. The reverse direction (impl without catalog
+/// row) is detected by the catalog test in `tool_catalog.rs`.
+#[cfg(test)]
+fn assert_catalog_impls_match() {
+    use crate::tool_catalog::{find, TOOL_CATALOG};
+    let binding = builtin_tools();
+    let registered: std::collections::HashSet<&str> =
+        binding.iter().map(|t| t.name()).collect();
+    for entry in TOOL_CATALOG {
+        if entry.always_allowed {
+            // Synthetic sentinels (`noop`, `none`) are NOT registered —
+            // they're handled by `registry::dispatch` as a special case.
+            continue;
+        }
+        assert!(
+            find(entry.name).is_some(),
+            "catalog row {} missing from TOOL_CATALOG",
+            entry.name
+        );
+        assert!(
+            registered.contains(entry.name),
+            "catalog row `{}` has no registered Tool impl — \
+             add `Arc::new(...)` to builtin_tools()",
+            entry.name,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -124,5 +164,18 @@ mod tests {
             let s = t.input_schema();
             assert_eq!(s["type"], "object", "{}: schema must declare object", t.name());
         }
+    }
+
+    #[test]
+    fn catalog_and_impls_agree() {
+        // Every catalog row has a registered impl; every impl has a
+        // catalog row. The first direction is checked here; the
+        // reverse direction (impl without catalog row) is implied by
+        // the registry's name lookup at dispatch time — if an impl
+        // existed but wasn't in the catalog, default_allowlist would
+        // not mention it and no agent could call it. The catalog test
+        // in tool_catalog.rs enforces the structural invariant that
+        // names line up.
+        assert_catalog_impls_match();
     }
 }

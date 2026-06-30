@@ -27,7 +27,10 @@
 //! Every item that was public at the top level of the old `memory.rs` is
 //! re-exported here so external callers don't need to change.
 
-mod agents;
+pub mod agents;
+pub mod db;
+pub mod research_session;
+
 mod behavior;
 mod context;
 mod events;
@@ -154,8 +157,9 @@ impl Memory {
     /// Bump `last_accessed_at` for one observation. Called by retrieval
     /// paths (search_semantic / peek_semantic / search_behavior /
     /// peek_behavior) so the consolidation service can decay unused
-    /// memories. Errors are swallowed — losing the timestamp is not
-    /// worth failing a read.
+    /// memories. Errors are logged at `warn` and swallowed — losing the
+    /// timestamp is not worth failing a read, but a silent DB error here
+    /// would make the consolidation decay model quietly wrong.
     pub async fn bump_last_accessed(&self, kind: &str, id: i64) {
         let table = match kind {
             "semantic" => "semantic_memories",
@@ -164,7 +168,14 @@ impl Memory {
         };
         let sql = format!("UPDATE {table} SET last_accessed_at = ?1 WHERE id = ?2");
         let now = chrono::Utc::now().to_rfc3339();
-        let _ = self.db.conn().execute(&sql, (now, id)).await;
+        if let Err(e) = self.db.conn().execute(&sql, (now, id)).await {
+            tracing::warn!(
+                kind = %kind,
+                id = id,
+                error = %e,
+                "bump_last_accessed UPDATE failed; decay model will be slightly off"
+            );
+        }
     }
 
     /// Back-compat shim: the old API exposed `tokenize` as an associated

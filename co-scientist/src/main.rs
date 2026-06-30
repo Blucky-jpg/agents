@@ -20,6 +20,7 @@ use co_scientist::{
     db::Db,
     memory::{new_run_id, ContextLimits, Memory},
     runner::{Runner, RunnerConfig},
+    EventBus, MemoryEvent,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -182,6 +183,23 @@ async fn cmd_serve(db_path: &str) -> Result<()> {
     // tasks own clones of shutdown_rx and observe completion on their own.
     let (_shutdown_tx, shutdown_rx) = ctrl_c_shutdown_pair();
 
+    // Subscribe to the bus so TaskFailed / MarkerFailed events surface
+    // to stderr instead of going to a channel with zero listeners.
+    let forwarder = spawn_failure_forwarder(bus.clone());
+
+    // Failure aggregator: roll up MarkerFailed events into periodic
+    // FailureStats summaries. Same role as in supervisor_bundle.
+    let aggregator_bus = bus.clone();
+    let aggregator_shutdown = shutdown_rx.clone();
+    let aggregator_handle = tokio::spawn(async move {
+        co_scientist::run_failure_aggregator(
+            aggregator_bus,
+            co_scientist::FailureAggregatorConfig::default(),
+            aggregator_shutdown,
+        )
+        .await;
+    });
+
     // Spawn the background consolidation service.
     let consolidation_cfg = co_scientist::PromotionConfig::default();
     let consolidation_shutdown = shutdown_rx.clone();
@@ -200,8 +218,10 @@ async fn cmd_serve(db_path: &str) -> Result<()> {
     );
     run_worker(mem, q, Arc::new(reg), cfg, shutdown_rx).await?;
 
-    // Wait for consolidation service to shut down.
+    // Wait for consolidation service and forwarder to drain.
     let _ = consolidation_handle.await;
+    let _ = aggregator_handle.await;
+    let _ = forwarder.await;
     Ok(())
 }
 
@@ -287,6 +307,12 @@ async fn cmd_start(args: &[String], db_path: &str) -> Result<()> {
     // comment for why this matters.
     let (_shutdown_tx, shutdown_rx) = co_scientist::worker::ctrl_c_shutdown_pair();
     let bus = co_scientist::EventBus::default();
+
+    // Subscribe to the bus BEFORE handing it to the bundle so we don't
+    // miss early failures. The forwarder exits when the bundle's last
+    // sender drops (RecvError::Closed).
+    let forwarder = spawn_failure_forwarder(bus.clone());
+
     let outcome = supervisor_bundle::run(
         db_path.to_string().into(),
         bus,
@@ -298,18 +324,65 @@ async fn cmd_start(args: &[String], db_path: &str) -> Result<()> {
     )
     .await?;
 
+    // Wait for the forwarder to drain any final events the bundle
+    // emitted during shutdown.
+    let _ = forwarder.await;
+
+    let supervisor_failed = outcome.supervisor.is_err();
     let reason = match outcome.supervisor {
         Ok(()) => "ok".to_string(),
         Err(e) => format!("error: {e:#}"),
     };
     eprintln!("session {} complete: {}", session_id, reason);
-    // Surface fatal bundle wiring errors (DB unreachable, etc.) as
-    // exit code 1 — previously this happened implicitly when
-    // `Supervisor::run` returned Err. Now the bundle returns
-    // `BundleOutcome` which only has the supervisor's Result; wiring
-    // errors propagate as `Err` from the outer `run` and we convert
-    // them to a non-zero exit here.
+    if supervisor_failed {
+        // Non-zero exit so CI / shells / scripts can detect failure.
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// Subscribe to `event_bus` and write task/marker failures to stderr.
+/// Returns the `JoinHandle`; drop it (or `.await` it) when done. The
+/// task exits naturally when the bus closes (no remaining senders).
+///
+/// Scope: only the *failure* variants (`TaskFailed`, `MarkerFailed`,
+/// `FailureStats`). Routine events like `TaskClaimed` / `TaskCompleted`
+/// are dropped — they're not failures and would flood stderr during a
+/// long session. Subscribers that want the full event stream should
+/// bring their own forwarder.
+fn spawn_failure_forwarder(bus: EventBus) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut rx = bus.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(MemoryEvent::TaskFailed {
+                    task_id,
+                    worker_id,
+                    error,
+                }) => {
+                    eprintln!("[task-failed] {task_id} (worker={worker_id}): {error}");
+                }
+                Ok(MemoryEvent::MarkerFailed { agent, op, error }) => {
+                    eprintln!("[marker-failed] {agent}.{op}: {error}");
+                }
+                Ok(MemoryEvent::FailureStats { window, top, total }) => {
+                    let parts: Vec<String> = top
+                        .iter()
+                        .map(|c| format!("{}:{}={}", c.agent, c.op, c.count))
+                        .collect();
+                    eprintln!(
+                        "[failure-stats] window={}s total={} top=[{}]",
+                        window.as_secs(),
+                        total,
+                        parts.join(", ")
+                    );
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 fn parse_duration_secs(s: &str) -> Option<u64> {

@@ -66,7 +66,8 @@ impl Tool for ArchiveObservationTool {
             }
         }
         // Log the archive as an event for traceability.
-        ctx.memory
+        if let Err(e) = ctx
+            .memory
             .log_event(
                 &ctx.run_id,
                 &ctx.agent_name,
@@ -79,7 +80,14 @@ impl Tool for ArchiveObservationTool {
                 })),
             )
             .await
-            .ok();
+        {
+            tracing::warn!(
+                kind = %kind,
+                id = id,
+                error = %e,
+                "log_event failed for observation_archived"
+            );
+        }
         Ok(serde_json::json!({ "archived": true, "kind": kind, "id": id }))
     }
 }
@@ -148,7 +156,8 @@ impl Tool for DeleteObservationTool {
             ));
         }
         let n = ctx.memory.delete_behavior(id).await?;
-        ctx.memory
+        if let Err(e) = ctx
+            .memory
             .log_event(
                 &ctx.run_id,
                 &ctx.agent_name,
@@ -162,7 +171,14 @@ impl Tool for DeleteObservationTool {
                 })),
             )
             .await
-            .ok();
+        {
+            tracing::warn!(
+                kind = %kind,
+                id = id,
+                error = %e,
+                "log_event failed for observation_deleted"
+            );
+        }
         Ok(serde_json::json!({ "deleted": true, "id": id, "rows_removed": n }))
     }
 }

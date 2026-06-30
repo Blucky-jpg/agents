@@ -1,7 +1,7 @@
 //! In-process event bus. Dual-write companion to the `events` /
 //! `semantic_memories` / `behavior_memories` tables: every write also
 //! publishes a [`MemoryEvent`] on a `tokio::sync::broadcast` channel so a
-//! TUI/UI can observe live without re-querying SQLite.
+//! External subscribers can observe live without re-querying SQLite.
 //!
 //! SQLite remains the source of truth for replay and post-hoc analysis.
 //! The bus is a live tail; if a subscriber is slow, the older events are
