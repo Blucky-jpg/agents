@@ -18,3 +18,11 @@ Thumbs.db
 
 # Session state (not source code)
 /.kilo/
+/.mimocode/
+
+# Local Claude Code settings (contains machine-specific paths)
+/.claude/
+
+# Upstream reference repos surveyed for design (read-only research inputs;
+# listed in README; lives at ref/).
+/ref/
