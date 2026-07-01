@@ -265,8 +265,36 @@ impl Memory {
         limit: usize,
     ) -> Result<Vec<PeekedMemory>, MemoryError> {
         let q = query.trim();
+        // Empty query → fall back to most-recent rows. This mirrors
+        // `search_semantic` so the two paths stay symmetric; UI callers
+        // that pass `""` to get the timeline view get sensible results
+        // instead of an empty Vec.
         if q.is_empty() {
-            return Ok(Vec::new());
+            let mut rows = self
+                .db
+                .conn()
+                .query(
+                    "SELECT id, scope, summary FROM semantic_memories
+                     WHERE archived = 0
+                     ORDER BY id DESC
+                     LIMIT ?1",
+                    [limit as i64],
+                )
+                .await?;
+            let mut out: Vec<PeekedMemory> = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let scope: String = row.get(1)?;
+                let summary: String = row.get(2)?;
+                out.push(PeekedMemory {
+                    id,
+                    kind: PeekedKind::Semantic,
+                    summary,
+                    label: scope,
+                    tokens_approx: 0,
+                });
+            }
+            return Ok(out);
         }
         let terms = tokenize(q);
         if terms.is_empty() {

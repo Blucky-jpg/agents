@@ -158,21 +158,27 @@ pub fn edge_summaries() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Tokenize one string into normalized word tokens. Splits on
+/// non-alphanumeric chars (except `-` and `_`, which we keep so
+/// hyphenated terms like `KRAS-G12C` / `alpha-fold` survive intact
+/// — the memory tokenizer preserves them too), lowercases, and
+/// drops tokens whose visible form is < 3 chars. Matches what
+/// `Memory::tokenize` would index on.
+fn lex_tokens(s: &str) -> std::collections::HashSet<String> {
+    s.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() > 2)
+        .collect()
+}
+
 /// Sanity check on a query–observation pair: does this observation
 /// match this query lexically? Used as the ground truth for
 /// recall-precision probes. Conservative — only counts tokens that
 /// appear in both.
 pub fn lexical_match(query: &str, summary: &str) -> bool {
-    let q_tokens: std::collections::HashSet<String> = query
-        .split_whitespace()
-        .map(|w| w.to_lowercase())
-        .filter(|w| w.len() > 2)
-        .collect();
-    let s_tokens: std::collections::HashSet<String> = summary
-        .split_whitespace()
-        .map(|w| w.to_lowercase())
-        .filter(|w| w.len() > 2)
-        .collect();
+    let q_tokens = lex_tokens(query);
+    let s_tokens = lex_tokens(summary);
     if q_tokens.is_empty() {
         return false;
     }
