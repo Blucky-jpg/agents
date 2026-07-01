@@ -92,6 +92,12 @@ pub struct RunSnapshot {
     pub snapshot_count: usize,
     /// The most recent prior snapshot, if any. Used to detect stability.
     pub previous_snapshot: Option<Vec<(i64, f64)>>,
+    /// Total tournament matches recorded so far in this session. Used
+    /// to gate the elo_stability termination: zero matches means Elo
+    /// scores haven't been tested through comparison, so "stable" is
+    /// trivially true and would terminate a fresh session before the
+    /// tournament has even started.
+    pub match_count: usize,
 }
 
 /// Termination verdict.
@@ -153,7 +159,20 @@ impl TerminationPolicy {
             // checked `snapshots.len() >= threshold` AFTER pushing the
             // current one, so termination fires on the iteration that
             // brings the history length up to (or past) threshold.
-            if stable && snap.snapshot_count + 1 >= snap.stability_threshold {
+            //
+            // Additionally: require at least one tournament match to
+            // have been played. Without this, a session that produces
+            // N hypotheses but never records a single match (e.g. the
+            // ranking agent's tool call fails on every turn) has Elo
+            // scores unchanged from initialization. Those unchanged
+            // scores are trivially "stable" across snapshots, so the
+            // termination fires before the tournament has even started.
+            // Gate on match_count >= 1 to ensure the ranking has at
+            // least produced one comparison before we trust stability.
+            if stable
+                && snap.snapshot_count + 1 >= snap.stability_threshold
+                && snap.match_count >= 1
+            {
                 return TerminationDecision::Terminate {
                     reason: "elo_stability".to_string(),
                 };
@@ -235,6 +254,9 @@ mod tests {
             stability_threshold: 3,
             snapshot_count: 0,
             previous_snapshot: None,
+            // Default to 1 so tests that aren't exercising the
+            // match_count gate don't accidentally trip it.
+            match_count: 1,
         }
     }
 
@@ -306,7 +328,9 @@ mod tests {
         let p = TerminationPolicy::new();
         // Same top-2 across snapshots, stability_threshold=3 means
         // termination fires when snapshot_count + 1 >= 3.
-        let make = |count: usize, prev: Option<Vec<(i64, f64)>>| RunSnapshot {
+        let make = |count: usize,
+                    prev: Option<Vec<(i64, f64)>>,
+                    match_count: usize| RunSnapshot {
             elapsed: Duration::from_secs(5),
             deadline: Duration::ZERO,
             budget_usd: 0.0,
@@ -317,25 +341,26 @@ mod tests {
             stability_threshold: 3,
             snapshot_count: count,
             previous_snapshot: prev,
+            match_count,
         };
 
         // snapshot_count=0, no previous → not stable, no terminate.
         assert_eq!(
-            p.evaluate(&make(0, None)),
+            p.evaluate(&make(0, None, 1)),
             TerminationDecision::Continue
         );
 
         // snapshot_count=1 (one prior), previous matches current, but
         // count+1 = 2 < threshold=3 → no terminate.
         assert_eq!(
-            p.evaluate(&make(1, Some(vec![(1, 1200.0), (2, 1190.0)]))),
+            p.evaluate(&make(1, Some(vec![(1, 1200.0), (2, 1190.0)]), 1)),
             TerminationDecision::Continue
         );
 
         // snapshot_count=2 (two priors), previous matches current,
         // count+1 = 3 >= threshold=3 → terminate.
         assert_eq!(
-            p.evaluate(&make(2, Some(vec![(1, 1200.0), (2, 1190.0)]))),
+            p.evaluate(&make(2, Some(vec![(1, 1200.0), (2, 1190.0)]), 1)),
             TerminationDecision::Terminate {
                 reason: "elo_stability".to_string()
             }
@@ -344,8 +369,51 @@ mod tests {
         // snapshot_count=2, previous DIFFERS from current by > epsilon → not
         // stable, no terminate.
         assert_eq!(
-            p.evaluate(&make(2, Some(vec![(1, 1300.0), (2, 1190.0)]))),
+            p.evaluate(&make(2, Some(vec![(1, 1300.0), (2, 1190.0)]), 1)),
             TerminationDecision::Continue
+        );
+    }
+
+    /// Regression: a session that produces N hypotheses but never
+    /// records a single tournament match must NOT terminate on
+    /// elo_stability. Without the match_count gate, the unchanged Elo
+    /// scores produce trivially-stable snapshots across the idle
+    /// window and the supervisor exits before the tournament has even
+    /// started. This is the failure mode observed on 2026-06-30 when
+    /// the ranking agent's tool call hallucinated a non-existent
+    /// `memory_op` op name.
+    #[test]
+    fn termination_policy_elo_stability_does_not_fire_without_matches() {
+        let p = TerminationPolicy::new();
+        let make = |match_count: usize| RunSnapshot {
+            elapsed: Duration::from_secs(60),
+            deadline: Duration::ZERO,
+            budget_usd: 0.0,
+            budget_spent_usd: 0.0,
+            top_hypotheses: vec![(1, 1200.0), (2, 1190.0)],
+            min_hypotheses: 2,
+            stability_epsilon: 25.0,
+            stability_threshold: 3,
+            snapshot_count: 2,
+            previous_snapshot: Some(vec![(1, 1200.0), (2, 1190.0)]),
+            match_count,
+        };
+
+        // Zero matches: even with snapshot_count=2 and a matching
+        // previous snapshot, the gate refuses to terminate. Without
+        // the gate this would return Terminate(elo_stability).
+        assert_eq!(
+            p.evaluate(&make(0)),
+            TerminationDecision::Continue,
+            "match_count=0 must not let elo_stability terminate",
+        );
+
+        // One match: the gate clears and the existing rule fires.
+        assert_eq!(
+            p.evaluate(&make(1)),
+            TerminationDecision::Terminate {
+                reason: "elo_stability".to_string()
+            },
         );
     }
 }

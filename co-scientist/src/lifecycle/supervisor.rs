@@ -430,7 +430,9 @@ impl Supervisor {
 
         // Build a snapshot of the top hypotheses for Elo stability check.
         let hyp_repo = HypothesisRepo::new(self.memory.db_arc());
+        let tour_repo = TournamentRepo::new(self.memory.db_arc());
         let top = hyp_repo.top_n(&self.session_id, 5).await?;
+        let match_count = tour_repo.match_count(&self.session_id).await? as usize;
         let top_pairs: Vec<(i64, f64)> = if top.len() >= self.config.min_hypotheses {
             top.iter().map(|h| (h.id, h.elo)).collect()
         } else {
@@ -449,6 +451,7 @@ impl Supervisor {
             stability_threshold: self.config.stability_threshold,
             snapshot_count: self.stability_snapshots.len(),
             previous_snapshot: previous_snapshot.clone(),
+            match_count,
         };
 
         let decision = self.termination_policy.evaluate(&snap);

@@ -29,6 +29,14 @@ use crate::runner::{Runner, RunnerConfig};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 use crate::tournament::matches::TournamentRepo;
 
+/// Maximum number of within-turn retries for the ranking agent when
+/// the first attempt fails to dispatch `record_tournament_match`. The
+/// cap exists because the LLM can occasionally fixate on a wrong
+/// format forever; 2 retries (3 total attempts) is enough headroom
+/// for the self-correction block to land while bounding the worst
+/// case at 3 × LLM latency per ranking task.
+const RANKING_MAX_RETRIES: u32 = 2;
+
 /// Per-session cache of [`Runner`] handles, keyed by `(session_id, agent_name)`.
 ///
 /// A long supervisor session that runs 50 generation / reflection /
@@ -311,10 +319,44 @@ impl Tool for RunAgentTool {
         let mut runner = runner_arc.lock().await;
 
         // Run the agent turn.
-        let outcome = runner
+        let mut outcome = runner
             .turn(agent, &user_prompt)
             .await
             .context("agent turn failed")?;
+
+        // Within-turn retry for ranking. The ranking agent is asked to
+        // emit exactly one `record_tournament_match` marker per turn;
+        // if the LLM hallucinates the op_name (e.g. emits `memory_op`
+        // instead — observed in the 2026-06-30 "Topologie of Neural
+        // nets" session) or invents the payload schema, dispatch fails
+        // and zero matches get recorded for this pair. Retry up to
+        // `RANKING_MAX_RETRIES` times with a self-correction message
+        // that re-asserts the format and includes the original prompt
+        // so the LLM still has the hypothesis IDs.
+        if agent_name == "ranking" && outcome.dispatched == 0 {
+            for attempt in 1..=RANKING_MAX_RETRIES {
+                let retry_prompt = build_ranking_retry_prompt(&user_prompt, attempt);
+                let retry_outcome = runner
+                    .turn(agent, &retry_prompt)
+                    .await
+                    .with_context(|| format!("ranking retry turn {attempt} failed"))?;
+                if retry_outcome.dispatched > 0 {
+                    // Merge retry results into the original outcome so
+                    // downstream code (ID extraction, follow-up enqueue)
+                    // sees the recovered markers.
+                    let mut merged: Vec<crate::skill::Marker> =
+                        (*outcome.markers).clone();
+                    merged.extend((*retry_outcome.markers).iter().cloned());
+                    outcome.markers = Arc::new(merged);
+                    outcome.cleaned_text = format!(
+                        "{}\n{}",
+                        outcome.cleaned_text, retry_outcome.cleaned_text
+                    );
+                    outcome.dispatched += retry_outcome.dispatched;
+                    break;
+                }
+            }
+        }
 
         // Extract IDs from dispatched markers.
         // Track which memory ids were created during this turn, so we can
@@ -583,7 +625,52 @@ async fn build_pairwise_prompt(
         .context("rendering ranking_pairwise prompt")
 }
 
-/// Build an evolution combine prompt with two hypotheses and their reviews.
+/// Build a self-correction prompt to recover from a ranking turn
+/// whose marker failed to dispatch. The retry message re-asserts the
+/// marker format (with explicit warnings about the common
+/// prefix-vs-op-name confusion) and re-includes the original user
+/// prompt so the LLM still has the hypothesis IDs in context.
+///
+/// `attempt` is 1-indexed so the LLM can see this is a retry, not a
+/// fresh task. Two retries max (see [`RANKING_MAX_RETRIES`]); after
+/// that the orchestrator gives up and the supervisor's idle-injection
+/// will re-enqueue the ranking task at the next idle tick.
+fn build_ranking_retry_prompt(original_user_prompt: &str, attempt: u32) -> String {
+    format!(
+        "{original}\n\n---\n\n\
+         ## Retry {attempt}/{max} — your previous marker was rejected\n\n\
+         The marker you emitted in your last response was not accepted. \
+         The most likely reasons, in order of observed frequency:\n\n\
+         1. **Wrong op name.** The op name slot must be exactly \
+         `record_tournament_match`. It must NOT be `memory_op`, \
+         `MEMORY_OP`, or any other name. `MEMORY_OP` is the marker \
+         prefix that already appears in the syntax — putting it in \
+         the op name slot is the most common mistake.\n\
+         2. **Wrong payload schema.** The payload must be a JSON \
+         object with EXACTLY these four fields and no others:\n\
+            - `hypothesis_a` (integer) — the first hypothesis ID from \
+         the prompt above\n\
+            - `hypothesis_b` (integer) — the second hypothesis ID from \
+         the prompt above\n\
+            - `winner` (integer) — `1` if hypothesis_a wins, `2` if \
+         hypothesis_b wins, `0` for a draw. Must be an integer, not \
+         a string.\n\
+            - `rationale` (string) — your reasoning explaining the \
+         decision.\n\
+         3. **Wrapped the marker.** Do not put the marker inside code \
+         fences, quotes, or any other delimiter. Just emit it as a \
+         line on its own.\n\n\
+         Please re-emit ONE marker, on its own line, in exactly this \
+         shape (substituting the actual hypothesis IDs from the prompt \
+         above):\n\n\
+         ```\n\
+         [[MEMORY_OP:record_tournament_match:{{\"hypothesis_a\":<ID1>,\"hypothesis_b\":<ID2>,\"winner\":<1 or 2>,\"rationale\":\"<your reasoning>\"}}]]\n\
+         ```",
+        original = original_user_prompt,
+        attempt = attempt,
+        max = RANKING_MAX_RETRIES,
+    )
+}
 async fn build_evolution_prompt(
     memory: &Memory,
     prompts: &Prompts,

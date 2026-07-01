@@ -849,6 +849,7 @@ impl Runner {
         Ok(TurnOutcome {
             cleaned_text: parsed.cleaned_text,
             markers: Arc::new(parsed.markers),
+            dispatched,
         })
     }
 
@@ -1116,6 +1117,13 @@ pub async fn dispatch_marker(
 pub struct TurnOutcome {
     pub cleaned_text: String,
     pub markers: Arc<Vec<crate::skill::Marker>>,
+    /// Number of markers that dispatched successfully in this turn.
+    /// Distinct from `markers.len()`: a marker can parse but fail
+    /// dispatch (unknown tool, missing required field, etc.). The
+    /// orchestrator uses this to decide whether to retry within the
+    /// same task — see `run_agent::call` for the ranking recovery
+    /// path.
+    pub dispatched: u32,
 }
 
 /// Render the "## Your prior self-critique" block. The same function

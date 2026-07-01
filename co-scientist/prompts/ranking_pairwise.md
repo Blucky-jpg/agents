@@ -32,15 +32,27 @@ Review of hypothesis 2:
 
 Reasoning and conclusion (end with "better idea: <1 or 2>"):
 
-After your reasoning, call the `record_tournament_match` tool by emitting this exact marker format in your response:
+After your reasoning, you MUST emit exactly one marker to record the result. The marker is a single line on its own. It has three parts, in order:
 
-  [[MEMORY_OP:record_tournament_match:{"hypothesis_a":{{ hypothesis_1_id }},"hypothesis_b":{{ hypothesis_2_id }},"winner":<1 or 2>,"rationale":"<your reasoning>"}}]]
+1. A fixed prefix consisting of two opening square brackets, the literal text `MEMORY_OP`, and a colon. (The square brackets and colon are part of the marker syntax, not part of any tool name.)
+2. The op name: exactly `record_tournament_match`.
+3. A colon, then a JSON object payload, then two closing square brackets.
 
-REQUIRED FIELDS:
-- `hypothesis_a` (integer): first hypothesis ID ({{ hypothesis_1_id }})
-- `hypothesis_b` (integer): second hypothesis ID ({{ hypothesis_2_id }})
-- `winner` (integer): 1 = hypothesis_a wins, 2 = hypothesis_b wins, 0 = draw
+CRITICAL — common mistakes that cause dispatch failure:
+- Do NOT use `memory_op` or `MEMORY_OP` as the op name. `MEMORY_OP` is part of the marker prefix above, not a tool name. The op name slot must be the actual tool name.
+- Do NOT invent your own payload fields. The runtime tool expects exactly the schema below; extra fields like `match_id`, `loser`, `winner_elo_delta`, `traits_rewarded`, `trait_penalties` will be rejected.
+- Do NOT use a string for `winner`. It must be the integer 1, 2, or 0.
+- Do NOT wrap the marker in code fences, quotes, or any other delimiter.
+
+REQUIRED payload fields (a JSON object with EXACTLY these four, no more, no less):
+- `hypothesis_a` (integer): the FIRST hypothesis ID, which is {{ hypothesis_1_id }}
+- `hypothesis_b` (integer): the SECOND hypothesis ID, which is {{ hypothesis_2_id }}
+- `winner` (integer): `1` if hypothesis_a wins, `2` if hypothesis_b wins, `0` for a draw
 - `rationale` (string): your reasoning explaining the decision
 
-EXAMPLE:
-  [[MEMORY_OP:record_tournament_match:{"hypothesis_a":42,"hypothesis_b":43,"winner":1,"rationale":"Hypothesis 42 has stronger mechanistic grounding and clearer testability criteria."}]]
+EXAMPLE — the JSON body your marker wraps, with concrete IDs from this turn. Replace the ID placeholders with the actual IDs from the prompt above. The marker delimiters themselves are real bracket characters in your output; this template shows only the body because the prompt-allowlist parser scans this file for literal marker prefixes.
+
+  For hypothesis {{ hypothesis_1_id }} winning, the body is:
+    {"hypothesis_a": {{ hypothesis_1_id }},"hypothesis_b": {{ hypothesis_2_id }},"winner": 1,"rationale": "Hypothesis {{ hypothesis_1_id }} has stronger mechanistic grounding."}
+
+  For hypothesis {{ hypothesis_2_id }} winning, set `winner` to 2 and adjust the rationale.

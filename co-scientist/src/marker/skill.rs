@@ -164,46 +164,104 @@ fn find_next_marker(text: &str, start: usize) -> Option<(&str, &str, usize, usiz
     Some((op_name, &text[json_start..json_end], marker_start, marker_end))
 }
 
-/// Detect malformed marker prefixes that `find_next_marker` rejects
-/// (empty payload, no terminator). Emits one warning per occurrence
-/// so the LLM can self-correct on the next turn.
-fn warn_about_malformed_prefixes(text: &str) {
-    let prefixes = ["[[MEMORY_OP:", "[[memory_op:"];
+/// One malformed `[[MEMORY_OP:...]]` (or `[[memory_op:...]]`) prefix
+/// found in an LLM response. Used by `warn_about_malformed_prefixes`
+/// to surface bad markers, and exposed as data so the detection rule
+/// can be unit-tested without a `tracing` subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MalformedMarker {
+    /// Byte position of the `[[MEMORY_OP:` / `[[memory_op:` prefix.
+    pub position: usize,
+    pub kind: MalformedKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedKind {
+    /// Marker had something after the op_name but it wasn't a JSON object.
+    EmptyOrNonObjectPayload,
+    /// Marker had no terminator at all (no `:` after the prefix, or
+    /// no bytes after the op_name).
+    Unclosed,
+}
+
+/// Pure: walk `text` and identify every `[[MEMORY_OP:` / `[[memory_op:`
+/// prefix that doesn't have a JSON object payload. Returns the position
+/// and kind of each malformed marker.
+///
+/// Must agree with `find_next_marker` on what counts as a valid marker.
+/// Both use the rule: the FIRST colon after the prefix separates the
+/// op_name from the JSON payload. Walk past that colon (and any
+/// whitespace) and the next non-whitespace byte should be `{`. The
+/// previous version walked past colons IMMEDIATELY after the prefix,
+/// which fired false positives on every valid marker whose op_name
+/// was non-empty (e.g. `[[MEMORY_OP:save_semantic:{...}]]` was fine
+/// because `s` isn't `:`, but `[[MEMORY_OP:memory_op:{...}]]` warned
+/// because `m` isn't `:`).
+pub(crate) fn find_malformed_prefixes(text: &str) -> Vec<MalformedMarker> {
+    const PREFIXES: &[&str] = &["[[MEMORY_OP:", "[[memory_op:"];
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
     let mut search_from = 0usize;
-    while let Some(rel) = prefixes
+    while let Some((prefix, rel_offset)) = PREFIXES
         .iter()
-        .filter_map(|p| text.get(search_from..)?.find(p).map(|o| (p, o)))
+        .filter_map(|p| text.get(search_from..).and_then(|s| s.find(p).map(|o| (*p, o))))
         .min_by_key(|(_, o)| *o)
     {
-        let (prefix, offset) = rel;
-        let abs = offset + search_from;
+        let abs = rel_offset + search_from;
         let after = abs + prefix.len();
-        // Walk past the colon and any whitespace.
-        let mut probe = after;
-        let bytes = text.as_bytes();
-        while probe < bytes.len() && (bytes[probe] == b':' || bytes[probe] == b' ' || bytes[probe] == b'\t') {
+        // Find the FIRST colon after the prefix. The marker format is
+        // `[[MEMORY_OP:<op_name>:<json>]]` — that colon is the boundary
+        // between op_name and JSON. The op_name itself is opaque to us
+        // (the parser accepts any ASCII identifier-shaped token).
+        let Some(colon_off) = text.get(after..).and_then(|s| s.find(':')) else {
+            out.push(MalformedMarker { position: abs, kind: MalformedKind::Unclosed });
+            search_from = abs + prefix.len();
+            continue;
+        };
+        let mut probe = after + colon_off + 1;
+        // Skip whitespace before the JSON. Some models emit `: {…}`.
+        while probe < bytes.len() && (bytes[probe] == b' ' || bytes[probe] == b'\t') {
             probe += 1;
         }
-        // Is there a `{` at probe? If not, this prefix is malformed.
         match bytes.get(probe) {
             Some(b'{') => {
-                // Could be malformed in other ways (unclosed) but the
-                // brace-counting loop in find_next_marker will report it.
+                // Valid: the JSON payload starts here. Could still be
+                // malformed downstream (unclosed brace), but
+                // `find_next_marker` reports that via its own path.
             }
             Some(_) => {
-                tracing::warn!(
-                    position = abs,
-                    "skill marker has empty or non-object payload; skipping"
-                );
+                out.push(MalformedMarker {
+                    position: abs,
+                    kind: MalformedKind::EmptyOrNonObjectPayload,
+                });
             }
             None => {
-                tracing::warn!(
-                    position = abs,
-                    "skill marker is unclosed (no payload or terminator); skipping"
-                );
+                out.push(MalformedMarker {
+                    position: abs,
+                    kind: MalformedKind::Unclosed,
+                });
             }
         }
         search_from = abs + prefix.len();
+    }
+    out
+}
+
+/// Emit warnings for each malformed marker prefix found in `text`.
+/// Used to surface marker errors so the LLM can self-correct on the
+/// next turn.
+fn warn_about_malformed_prefixes(text: &str) {
+    for m in find_malformed_prefixes(text) {
+        match m.kind {
+            MalformedKind::EmptyOrNonObjectPayload => tracing::warn!(
+                position = m.position,
+                "skill marker has empty or non-object payload; skipping"
+            ),
+            MalformedKind::Unclosed => tracing::warn!(
+                position = m.position,
+                "skill marker is unclosed (no payload or terminator); skipping"
+            ),
+        }
     }
 }
 
@@ -478,6 +536,79 @@ Done."#,
         assert_eq!(r.markers.len(), 1);
         // Some `]` chars remain in cleaned_text (parser caps at 10) but
         // the run didn't hang.
+    }
+
+    // ---- find_malformed_prefixes ------------------------------------------
+
+    /// The exact marker the ranking LLM emitted during the
+    /// 2026-06-30 "Topologie of Neural nets" session: op_name is
+    /// `memory_op` (the prefix hallucinated into the op slot), payload
+    /// is a JSON object. The previous walker fired
+    /// "empty or non-object payload" because it saw `m` (not `{`) right
+    /// after the prefix and didn't know to walk past the op_name.
+    /// After the fix this marker must be reported as valid (no entries).
+    #[test]
+    fn find_malformed_accepts_valid_marker_with_nontrivial_op_name() {
+        let text = r#"...reasoning.
+
+[[MEMORY_OP:memory_op:{"match_id":"H2_vs_H8","winner":"H2"}]]"#;
+        let malformed = find_malformed_prefixes(text);
+        assert!(
+            malformed.is_empty(),
+            "valid marker with op_name=memory_op must NOT be flagged; got {:?}",
+            malformed,
+        );
+    }
+
+    /// Canonical case from production: `[[MEMORY_OP:save_semantic:{...}]]`
+    /// was always valid under the old walker (lucky: `s` isn't `:`),
+    /// and must stay valid under the new walker.
+    #[test]
+    fn find_malformed_accepts_canonical_save_semantic() {
+        let text = r#"[[MEMORY_OP:save_semantic:{"scope":"x","summary":"y"}]]"#;
+        assert!(find_malformed_prefixes(text).is_empty());
+    }
+
+    /// Empty payload (no `{` after the op_name colon): real malformed.
+    #[test]
+    fn find_malformed_flags_empty_payload() {
+        let text = "before [[MEMORY_OP:save_semantic:]] after";
+        let malformed = find_malformed_prefixes(text);
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].kind, MalformedKind::EmptyOrNonObjectPayload);
+    }
+
+    /// No terminator at all (prefix then nothing): unclosed.
+    #[test]
+    fn find_malformed_flags_unclosed_prefix() {
+        let text = "tail [[MEMORY_OP:save_semantic:";
+        let malformed = find_malformed_prefixes(text);
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].kind, MalformedKind::Unclosed);
+    }
+
+    /// Whitespace after the colon (`{` after `: {`) must be tolerated
+    /// the same way `find_next_marker` tolerates it.
+    #[test]
+    fn find_malformed_accepts_whitespace_before_json() {
+        let text = r#"[[MEMORY_OP:save_semantic: {"scope":"x"}]]"#;
+        assert!(find_malformed_prefixes(text).is_empty());
+    }
+
+    /// Lowercase prefix is treated identically to uppercase.
+    #[test]
+    fn find_malformed_accepts_lowercase_prefix() {
+        let text = r#"[[memory_op:save_semantic:{"k":"v"}]]"#;
+        assert!(find_malformed_prefixes(text).is_empty());
+    }
+
+    /// Non-object payload (e.g. an array) is flagged.
+    #[test]
+    fn find_malformed_flags_non_object_payload() {
+        let text = r#"[[MEMORY_OP:noop:[1,2,3]]]"#;
+        let malformed = find_malformed_prefixes(text);
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].kind, MalformedKind::EmptyOrNonObjectPayload);
     }
 }
 
