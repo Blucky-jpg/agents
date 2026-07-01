@@ -39,10 +39,19 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 futures = "0.3"
+proptest = "1"
+rand = "0.8"
 
 [[test]]
 name = "integration"
 required-features = ["test-helpers"]
+
+# 24/7 soak benchmark for the memory subsystem. Offline (no LLM).
+# Opt-in: `cargo test --test memory_soak -- --ignored --nocapture`.
+# Every test is `#[ignore]` so default `cargo test` skips it.
+[[test]]
+name = "memory_soak"
+path = "tests/memory_soak/mod.rs"
 
 
 [[bin]]
