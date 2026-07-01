@@ -59,7 +59,7 @@ The composite audit (`metaharness_oia_audit`) returned `data: null` with `exitCo
 
 Sorted by impact (largest gap first):
 
-- **R1 — memoryUsefulness gap (34/100):** The 7-agent pipeline has `Memory` (SQLite), `PromptContextCache`, and `MemoryEvent` flows but lacks explicit memory-hooks evidence in the harness layer. Consider adding `.claude/` memory integration tests and a documented memory-hooks contract.
+- **R1 — memoryUsefulness = 34/100 (DO NOT PURSUE):** the score is not a memory-quality measure. Post-hoc inspection of `metaharness/dist/repo-scorecard.js:69-72` (the actual rubric called by `metaharness_score`) shows the formula is `min(fileCount, 30) × 2 + languages × 5 + min(tokens, 25)`. The 34 reflects repo shape (single-language Rust with limited high-signal root files), not memory architecture quality. The real memory gaps — semantic search at retrieval time (currently lexical inverted-index, see `co-scientist/src/memory/semantic.rs:146-230`), per-turn context (currently only at step 0, see `co-scientist/src/agent_loop/runner.rs:997`), cross-session defaults (currently run-scoped) — are not measured by this score and would not move it if fixed. Track memory quality against a separate benchmark; do not chase this number.
 - **R2 — harnessFit gap (56/100):** The harness fits moderately well but the scorecard suggests friction in at least one of {agent_topology alignment, MCP surface, plugin loadout}. The `agent_topology` from §3 lists `maintainer, tester, security` as roles; the score suggests friction in at least one of these role-specific configurations. Inspect `.claude/agents/` and `co-scientist/agents.rs` for role configs and identify which role's allowlist or skill loadout is incomplete.
 - **R3 — taskCoverage (79/100):** Coverage is good but not perfect. Identify the 21% gap (likely the bucket-reshuffled modules per CONTEXT.md, since 91 files are mid-refactor and tests haven't been verified).
 - **R4 — empirical verification:** The `compileConfidence = 90/100` score is a structural estimate; the working tree is mid-refactor and `cargo build`/`cargo test` have not been verified against this state. Run those commands before treating the score as empirical.
@@ -91,6 +91,7 @@ Sorted by impact (largest gap first):
 | Memory keys persisted | 2026-07-01T09:02:00Z-oia_audit, 2026-07-01T09:02:00Z-score, 2026-07-01T09:02:00Z-genome |
 | Memory timestamp (shared) | 2026-07-01T09:02:00Z |
 | **Memory tags parameter** | **Backend bug:** MCP `memory_store` accepts tags but the `sql.js + HNSW` backend silently drops the tags field — verified across two independent insertion attempts (standard insert, and delete-then-fresh-insert). The stored values themselves are correct and retrievable. Tags were not load-bearing for downstream drift detection (which uses fingerprint + value comparison) or for this report composition (which reads by namespace + key). Backend bug filed separately; does not affect this task. |
+| **memoryUsefulness rubric (post-hoc)** | Discovered after the run by reading `metaharness/dist/repo-scorecard.js:69-72` in the local ruflo install. The score is `min(fileCount, 30) × 2 + languages × 5 + min(tokens, 25)` — a repo-scale heuristic, not a memory-quality measurement. R1 in §5 was rewritten to reflect this; the score itself (34) is unchanged. |
 
 ---
 
@@ -99,6 +100,7 @@ Sorted by impact (largest gap first):
 - **`compileConfidence` is unverified empirically**: the working tree is mid-refactor (91 files changed per `co-scientist/../CONTEXT.md`) and `cargo build` / `cargo test` have not been run against this state. Treat `compileConfidence = 90/100` as a structural estimate, not an empirical measurement.
 - **Memory backend tag-drop**: as noted in Provenance §6, the ruflo `sql.js + HNSW` memory backend has a confirmed bug where the `tags` parameter is silently dropped. Values persist correctly; tags do not. This affects all ruflo memory users, not just this run.
 - **Spec-vs-tool shape drift**: the spec's example response shapes (`{success, data: {...}}` with populated data objects) differ from the actual tool returns (e.g., `data: null` on clean audit runs, score fields on 0-100 scale rather than 0-1 floats). The implementer adapted to actual tool behavior; the report reflects real tool outputs.
+- **`memoryUsefulness` does not measure memory quality**: discovered post-hoc by reading the local ruflo install at `metaharness/dist/repo-scorecard.js:69-72`. The formula is `min(fileCount, 30) × 2 + languages × 5 + min(tokens, 25)` — purely repo-scale signals. The original §5 R1 advised chasing this number; that advice has been retracted in the amended R1. Real memory gaps (semantic search at retrieval, per-turn context, cross-session defaults) need a separate measurement — not this score.
 
 ---
 
