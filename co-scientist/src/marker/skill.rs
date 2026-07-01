@@ -156,9 +156,26 @@ fn find_next_marker(text: &str, start: usize) -> Option<(&str, &str, usize, usiz
         }
     }
     if term_len == 0 {
-        // No terminator at all — treat the marker as malformed. `parse_markers`
-        // will surface this as a warning so the LLM sees the issue.
-        return None;
+        // No `]]` terminator. Accept the marker anyway — the JSON
+        // body is well-formed (we brace-counted it), and LLMs
+        // frequently forget to close the marker when their response
+        // runs long. Observed in the 2026-07-01 "Topologie of Neural
+        // nets" session: 2 of 3 generation turns emitted complete
+        // JSON bodies but no `]]`, and the parser silently dropped
+        // them — `dispatched: 0` with no `memory_op_failed` event,
+        // so the failure-stats counter showed 0 and the session
+        // stalled with only 1 of 3 hypotheses recorded.
+        //
+        // Log at INFO level so this case is visible in production
+        // logs. The strict-mode rejection is preserved for genuinely
+        // malformed payloads (incomplete JSON, junk text where the
+        // payload should be) — those are caught earlier by the
+        // `json_end = json_end?` short-circuit above.
+        tracing::info!(
+            op = op_name,
+            json_len = json_end - json_start,
+            "marker accepted without trailing ']]'; LLM probably forgot to close the marker"
+        );
     }
     let marker_end = json_end + term_len;
     Some((op_name, &text[json_start..json_end], marker_start, marker_end))
@@ -485,6 +502,44 @@ Done."#,
         let r = parse_markers(text);
         assert!(r.markers.is_empty());
         assert!(r.cleaned_text.contains("preamble"));
+    }
+
+    /// Regression for the 2026-07-01 silent-drop bug: the LLM emits a
+    /// well-formed JSON body but forgets the closing `]]`. The parser
+    /// must still extract the marker — otherwise `dispatched: 0` with
+    /// no `memory_op_failed` event, and the failure is invisible.
+    /// Observed: 2 of 3 generation turns in the "Topologie of Neural
+    /// nets" session lost their `record_hypothesis` markers this way,
+    /// so the session ended up with 1 of 3 hypotheses and stalled.
+    #[test]
+    fn accepts_marker_without_trailing_brackets() {
+        let text = r#"preamble [[MEMORY_OP:record_hypothesis:{"summary":"x","details":{"k":1}}"#;
+        let r = parse_markers(text);
+        assert_eq!(r.markers.len(), 1, "marker must be extracted despite missing ]]");
+        assert_eq!(r.markers[0].op, "record_hypothesis");
+        assert_eq!(r.markers[0].payload["summary"], "x");
+        assert!(r.cleaned_text.contains("preamble"));
+    }
+
+    /// Same as above but with the marker at end of input — common case
+    /// when the LLM emits the marker as the very last thing and
+    /// forgets the closing `]]`.
+    #[test]
+    fn accepts_marker_at_eof_without_trailing_brackets() {
+        let text = r#"[[MEMORY_OP:save_semantic:{"scope":"x","summary":"y"}"#;
+        let r = parse_markers(text);
+        assert_eq!(r.markers.len(), 1);
+        assert_eq!(r.markers[0].op, "save_semantic");
+        assert_eq!(r.markers[0].payload["summary"], "y");
+    }
+
+    /// Incomplete JSON (no closing `}`) is still rejected — only the
+    /// missing terminator is relaxed, not the brace count.
+    #[test]
+    fn incomplete_json_still_rejected() {
+        let text = "[[MEMORY_OP:save_semantic:{\"scope\":\"x\"";
+        let r = parse_markers(text);
+        assert!(r.markers.is_empty(), "incomplete JSON must still fail");
     }
 
     /// A mix: one valid marker, one malformed (empty payload), one
