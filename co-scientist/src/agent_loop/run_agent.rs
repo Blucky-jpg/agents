@@ -272,6 +272,30 @@ impl Tool for RunAgentTool {
             user_prompt.to_string()
         };
 
+        // Guard: an empty built prompt means the agent has nothing to
+        // do (e.g. ranking fired before ≥2 hypotheses reached the
+        // right state). Skip the LLM call entirely — calling it with
+        // just auto-context + marker reminder produces hallucinated
+        // tool calls (observed: `[[MEMORY_OP:add:...]]` with
+        // fabricated payload schema, plus IDs borrowed from the
+        // semantic-memory auto-context rather than the hypothesis
+        // table). Mark the task complete with an explicit
+        // `no_op: true` so the supervisor's idle tick can re-decide.
+        if user_prompt.trim().is_empty() {
+            info!(
+                agent = %agent_name,
+                "skipping LLM call: built prompt is empty (no work to do); idle-injection will re-enqueue when ready"
+            );
+            return Ok(json!({
+                "cleaned_text": String::new(),
+                "markers_dispatched": 0,
+                "hypothesis_ids": [],
+                "review_ids": [],
+                "no_op": true,
+                "reason": "empty_prompt",
+            }));
+        }
+
         // Resolve the agent.
         let agent = AGENTS
             .iter()
@@ -989,13 +1013,20 @@ pub struct FollowUpSpec {
     pub requires_hypothesis: bool,
 }
 
-/// The pipeline DAG. Currently five edges: generation → reflection
-/// (per hypothesis), reflection → ranking, evolution → reflection
-/// (per hypothesis), and the three-stage experiment chain
-/// (design → execute → evaluate → reflection_on_result).
+/// The pipeline DAG. Four edges: generation → reflection (per
+/// hypothesis), evolution → reflection (per hypothesis), and the
+/// three-stage experiment chain (design → execute → evaluate →
+/// reflection_on_result).
 ///
-/// New stages add one row here. New agents add a row to the table that
-/// owns them, not a new arm to `enqueue_follow_ups`.
+/// **Note**: `reflection → ranking` is NOT a follow-up edge. Ranking
+/// is a session-wide operation that needs ≥2 hypotheses to be
+/// meaningful, and the gate is already enforced by the
+/// `IDLE_SPECS[0] / ranking/RunTournamentBatch` predicate
+/// (`total_hypotheses >= min_hypotheses`). Adding the edge here too
+/// would race against the gate and enqueue a ranking task even when
+/// only one hypothesis exists, which in turn feeds the LLM an empty
+/// prompt (no candidates → no template body → no marker schema to
+/// follow) and produces hallucinated tool calls.
 pub static FOLLOW_UP_SPECS: &[FollowUpSpec] = &[
     FollowUpSpec {
         from_agent: "generation",
@@ -1012,14 +1043,6 @@ pub static FOLLOW_UP_SPECS: &[FollowUpSpec] = &[
         next_mode: "reflection_review",
         priority: 100,
         requires_hypothesis: true,
-    },
-    FollowUpSpec {
-        from_agent: "reflection",
-        from_mode: None,
-        next_agent: "ranking",
-        next_mode: "ranking_pairwise",
-        priority: 100,
-        requires_hypothesis: false,
     },
     FollowUpSpec {
         from_agent: "experiment",
@@ -1344,9 +1367,17 @@ mod tests {
         assert!(e.is_some());
         assert!(e.unwrap().requires_hypothesis);
 
-        // reflection → ranking (one-shot)
-        let r = spec_for("reflection", "");
-        assert_eq!(r.unwrap().next_agent, "ranking");
+        // reflection is now a TERMINAL node in FOLLOW_UP_SPECS — ranking
+        // is fired by IDLE_SPECS[0] (gated on total_hypotheses >=
+        // min_hypotheses), not as a per-reflection follow-up. The
+        // follow-up edge was removed because it raced against the
+        // idle-injection gate and enqueued ranking when only 1
+        // hypothesis existed, which fed the LLM an empty prompt and
+        // produced hallucinated tool calls.
+        assert!(
+            spec_for("reflection", "").is_none(),
+            "reflection → ranking must NOT be a follow-up; it's gated by IDLE_SPECS"
+        );
 
         // 3-stage experiment chain
         assert_eq!(

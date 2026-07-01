@@ -266,6 +266,12 @@ impl HypothesisRepo {
     }
 
     /// Get hypotheses that need tournament matches (fewer than threshold matches).
+    /// Includes hypotheses in `reviewed` state so the first ranking match
+    /// can bootstrap — otherwise the pipeline deadlocks because
+    /// `record_tournament_match` is the only thing that transitions a
+    /// hypothesis out of `reviewed`, and `record_tournament_match` can
+    /// only be called from the ranking prompt, which needs ≥2 candidates
+    /// in `in_tournament`/`ranked` state.
     pub async fn needs_matches(&self, session_id: &str, threshold: i64, limit: usize) -> Result<Vec<Hypothesis>> {
         let mut rows = self
             .db
@@ -273,7 +279,9 @@ impl HypothesisRepo {
             .query(
                 "SELECT id, session_id, state, elo, parent_ids, semantic_id, matches_played, created_at
                  FROM hypotheses
-                 WHERE session_id = ?1 AND state IN ('in_tournament', 'ranked') AND matches_played < ?2
+                 WHERE session_id = ?1
+                   AND state IN ('reviewed', 'in_tournament', 'ranked')
+                   AND matches_played < ?2
                  ORDER BY matches_played ASC, elo DESC
                  LIMIT ?3",
                 (session_id, threshold, limit as i64),

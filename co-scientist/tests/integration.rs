@@ -1646,3 +1646,87 @@ async fn research_session_repo_cancel_orphaned_tasks() {
         assert_eq!(err.as_deref(), Some("[startup-recovery]"));
     }
 }
+
+/// Regression test for the ranking prompt deadlock observed on
+/// 2026-07-01. The pipeline used to require hypotheses in
+/// `in_tournament`/`ranked` state before `needs_matches` would return
+/// them, but `record_tournament_match` is the only thing that
+/// transitions a hypothesis out of `reviewed`. This created a chicken-
+/// and-egg deadlock: ranking couldn't bootstrap because there were no
+/// `in_tournament` candidates, so the LLM was fed an empty prompt
+/// (just auto-context + marker reminder) and hallucinated
+/// `[[MEMORY_OP:add:{...}]]` with a fabricated payload schema, then
+/// on retry `[[MEMORY_OP:record_tournament_match:{...}]]` with IDs
+/// borrowed from the semantic-memory auto-context rather than the
+/// hypothesis table.
+///
+/// Fix: `needs_matches` now also returns `reviewed` hypotheses, and
+/// `build_prompt_for_agent` returns an empty string when fewer than
+/// 2 candidates exist so the worker can short-circuit the LLM call.
+#[tokio::test]
+async fn needs_matches_includes_reviewed_hypotheses_for_bootstrap() {
+    use co_scientist::hypothesis::{HypothesisRepo, HypothesisState};
+
+    let mem = Memory::new(db::open_memory().await.unwrap());
+    let repo = HypothesisRepo::new(mem.db_arc());
+    let session = "needs-matches-bootstrap-test";
+
+    // Three hypotheses: one in `draft` (not yet reflected — should
+    // NOT be picked up), two in `reviewed` (the bootstrap case —
+    // MUST be picked up so the first tournament match can fire).
+    let draft_id = repo
+        .insert(session, None, &[], 1200.0)
+        .await
+        .unwrap();
+    let rev_a = repo
+        .insert(session, None, &[], 1200.0)
+        .await
+        .unwrap();
+    repo.update_state(rev_a, HypothesisState::Reviewed, false)
+        .await
+        .unwrap();
+    let rev_b = repo
+        .insert(session, None, &[], 1200.0)
+        .await
+        .unwrap();
+    repo.update_state(rev_b, HypothesisState::Reviewed, false)
+        .await
+        .unwrap();
+
+    // needs_matches(threshold=3, limit=2) returns hypotheses with
+    // matches_played < 3. The two `reviewed` ones qualify; the
+    // `draft` one does not (state filter excludes it).
+    let needs = repo.needs_matches(session, 3, 2).await.unwrap();
+    let ids: Vec<i64> = needs.iter().map(|h| h.id).collect();
+    assert!(
+        ids.contains(&rev_a) && ids.contains(&rev_b),
+        "both reviewed hypotheses must be returned for bootstrap; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&draft_id),
+        "draft hypotheses (not yet reflected) must NOT be returned; got {ids:?}"
+    );
+    assert_eq!(
+        needs.len(),
+        2,
+        "limit=2 should cap the result; got {} ({ids:?})",
+        needs.len()
+    );
+
+    // Also: a hypothesis that has already played enough matches
+    // (>= threshold) must NOT be returned — it's saturated.
+    let saturated = repo
+        .insert(session, None, &[], 1200.0)
+        .await
+        .unwrap();
+    repo.update_state(saturated, HypothesisState::InTournament, false)
+        .await
+        .unwrap();
+    repo.update_elo(saturated, 1500.0, 5).await.unwrap();
+    let needs = repo.needs_matches(session, 3, 10).await.unwrap();
+    assert!(
+        !needs.iter().any(|h| h.id == saturated),
+        "saturated hypothesis (matches_played >= threshold) must be excluded; got {:?}",
+        needs.iter().map(|h| h.id).collect::<Vec<_>>()
+    );
+}
